@@ -5,7 +5,7 @@ import {
   Check, X, ChevronLeft, ChevronRight, Sparkles, Heart, Trash2,
   Footprints, Bike, Activity, RefreshCw, Clock, Send, Edit3,
   ChevronDown, Wand2, Minus, Scale, Ruler, Camera, Wine, Leaf,
-  TrendingUp, TrendingDown, BarChart3, CalendarDays
+  TrendingUp, TrendingDown, BarChart3, CalendarDays, AlertTriangle, Sun, Moon
 } from "lucide-react";
 
 /* ============================================================
@@ -26,20 +26,33 @@ const ACCENTS = [
 const accentHex = (id) => (ACCENTS.find((a) => a.id === id) || ACCENTS[0]).hex;
 
 const ACT = {
-  sedentary: { f: 1.2,   label: "Mostly sitting", desc: "Desk job, little exercise" },
-  light:     { f: 1.375, label: "Lightly active", desc: "Light exercise 1–3 days/wk" },
-  moderate:  { f: 1.55,  label: "Moderately active", desc: "Exercise 3–5 days/wk" },
-  very:      { f: 1.725, label: "Very active", desc: "Hard exercise 6–7 days/wk" },
+  sedentary: { f: 1.2,   label: "Mostly sitting", desc: "Desk job, on your feet very little" },
+  light:     { f: 1.375, label: "Lightly active", desc: "Some walking / on your feet a bit" },
+  moderate:  { f: 1.55,  label: "Moderately active", desc: "On your feet a fair amount most days" },
+  very:      { f: 1.725, label: "Very active", desc: "Physical job or constantly moving" },
 };
+// Goals. "recomp" = lose fat and build muscle at the same time (eat near
+// maintenance, train hard, keep protein high).
 const GOALS = {
-  lose:     { label: "Lose fat", desc: "Gentle calorie deficit" },
-  maintain: { label: "Maintain", desc: "Recomp & stay steady" },
+  lose:     { label: "Lose fat", desc: "Calorie deficit" },
+  recomp:   { label: "Recomp", desc: "Lose fat + build muscle" },
+  maintain: { label: "Maintain", desc: "Hold steady" },
   gain:     { label: "Build muscle", desc: "Lean surplus" },
 };
+const PACES = {
+  gentle:     { label: "Gentle", desc: "Easy does it" },
+  standard:   { label: "Standard", desc: "Steady progress" },
+  aggressive: { label: "Aggressive", desc: "Hardcore — read the note", warn: true },
+};
 const ACCESS = {
-  gym:     { label: "Full gym", desc: "Weights + machines", icon: Dumbbell },
-  home:    { label: "Home / minimal", desc: "Bodyweight + a few items", icon: Activity },
-  outdoor: { label: "Outdoor", desc: "Walking, running, hiking", icon: Footprints },
+  gym:     { label: "Full gym", short: "Gym", desc: "Weights + machines", icon: Dumbbell },
+  home:    { label: "Home / minimal", short: "Home", desc: "Bodyweight + a few items", icon: Activity },
+  outdoor: { label: "Outdoor", short: "Outdoor", desc: "Walking, running, hiking", icon: Footprints },
+};
+const TOGETHER_MODES = {
+  none:  { label: "On our own", desc: "No shared sessions" },
+  few:   { label: "A few days", desc: "Mon · Wed · Sat" },
+  daily: { label: "Every day", desc: "One together each day" },
 };
 const TIMES = ["Morning", "Lunch", "Afternoon", "Evening"];
 const DRINKS = [
@@ -172,19 +185,33 @@ function computeTargets(p) {
   const base = 10 * kg + 6.25 * cm - 5 * age;
   const bmr = p.sex === "female" ? base - 161 : base + 5;
   const tdee = bmr * (ACT[p.activity]?.f || 1.2);
+  const pace = p.pace || "standard";
   let cal = tdee, clamped = false;
-  const gentle = p.pace === "gentle";
-  if (p.goal === "lose") cal = tdee * (gentle ? 0.88 : 0.8);
-  else if (p.goal === "gain") cal = Math.min(tdee * (gentle ? 1.07 : 1.12), tdee + 600);
+  if (p.goal === "lose") {
+    const m = pace === "gentle" ? 0.88 : pace === "aggressive" ? 0.72 : 0.8;
+    cal = tdee * m;
+  } else if (p.goal === "recomp") {
+    // eat near maintenance; aggressive leans to a small deficit
+    const m = pace === "aggressive" ? 0.9 : pace === "gentle" ? 1.0 : 0.95;
+    cal = tdee * m;
+  } else if (p.goal === "gain") {
+    const m = pace === "gentle" ? 1.07 : pace === "aggressive" ? 1.18 : 1.12;
+    const capAdd = pace === "aggressive" ? 800 : 600;
+    cal = Math.min(tdee * m, tdee + capAdd);
+  }
+  // Hard safety floor — never prescribe below this, even on Aggressive.
   const floor = p.sex === "female" ? 1300 : 1500;
   if (cal < floor) { cal = floor; clamped = true; }
   cal = round(cal, 10);
-  const perKg = p.goal === "lose" ? 2.0 : p.goal === "gain" ? 1.8 : 1.7;
+  const perKg = p.goal === "recomp" ? 2.1 : p.goal === "lose" ? 2.0 : p.goal === "gain" ? 1.8 : 1.7;
   const protein = clamp(round(perKg * kg), 40, 260);
   const fat = Math.max(40, round(0.9 * kg));
   const carbs = Math.max(50, round((cal - protein * 4 - fat * 9) / 4));
   const water_oz = clamp(round(mlToOz(35 * kg + 500), 4), 64, 160);
-  return { bmr: round(bmr), tdee: round(tdee), calories: cal, protein, carbs, fat, water_oz, clamped };
+  const warn = pace === "aggressive"
+    ? "Aggressive pace: faster isn't always better. Expect it to be demanding, and ease off if your energy, sleep, or mood dip."
+    : clamped ? "Calories were raised to a safe minimum." : "";
+  return { bmr: round(bmr), tdee: round(tdee), calories: cal, protein, carbs, fat, water_oz, clamped, warn };
 }
 
 function totals(log) {
@@ -267,35 +294,128 @@ async function estimateMacros(desc) {
   return { label: String(j.label || desc).slice(0, 40), cal: Math.max(0, Math.round(j.calories || 0)),
     p: Math.max(0, Math.round(j.protein_g || 0)), c: Math.max(0, Math.round(j.carbs_g || 0)), f: Math.max(0, Math.round(j.fat_g || 0)) };
 }
-async function aiFocusWorkout(profile, focus) {
+/* ---------- profile helpers + migration ---------- */
+// Older profiles stored a single `access` string and an `eveningTogether` bool.
+// Bring them forward to the new multi-access / together-mode shape, keeping the
+// legacy fields populated too so nothing that still reads them breaks.
+function migrate(p) {
+  if (!p) return p;
+  const q = { ...p };
+  if (!Array.isArray(q.accesses)) q.accesses = q.access ? [q.access] : ["gym"];
+  q.access = q.accesses[0];
+  if (!q.together) q.together = { mode: q.eveningTogether === false ? "none" : (q.eveningTogether ? "daily" : "few"), time: "Evening" };
+  if (!q.sessionsPerDay) q.sessionsPerDay = 1;
+  if (!q.secondTime) q.secondTime = "Evening";
+  if (!q.pace) q.pace = "standard";
+  return q;
+}
+const accessesOf = (p) => (p?.accesses?.length ? p.accesses : p?.access ? [p.access] : ["home"]);
+const accessesLabel = (p) => accessesOf(p).map((a) => ACCESS[a]?.short || a).join(" + ");
+
+/* ---------- workout building ---------- */
+function placeSlot(base, time) {
+  return {
+    id: uid(), time: time || "Lunch", done: false,
+    title: base.title, focus: base.focus, access: base.access, type: base.type,
+    duration: Math.round(base.duration || 35), location: base.location || "",
+    exercises: (base.exercises || []).map((e) => ({ name: String(e.name || ""), detail: String(e.detail || "") })),
+  };
+}
+function templateSlot(access, focus) {
+  const lib = FOCUS_TEMPLATES[access] || FOCUS_TEMPLATES.home;
+  const t = lib[focus] || lib[Object.keys(lib)[0]];
+  return { title: focus, focus, access, type: t.type, duration: t.duration, location: ACCESS[access]?.label || "", exercises: expand(t.ex) };
+}
+// Order a modality's focuses by learned preference (liked first, skipped last).
+function focusOrder(access, prefs) {
+  const arr = [...(FOCUS[access] || FOCUS.home)];
+  return arr
+    .map((f) => ({ f, s: (prefs?.like?.[f] || 0) - (prefs?.skip?.[f] || 0) }))
+    .sort((a, b) => b.s - a.s)
+    .map((x) => x.f);
+}
+// Which modality a given session of the day draws from. Session 1 favors
+// strength (gym > home > outdoor); a 2nd session leans to a different one.
+function sessionAccess(accesses, i) {
+  const order = ["gym", "home", "outdoor"].filter((a) => accesses.includes(a));
+  if (!order.length) return "home";
+  if (i === 0) return order[0];
+  return order.length > 1 ? order[order.length - 1] : order[0];
+}
+async function aiFocusWorkout(p, access, focus) {
+  const goalHint = p.goal === "recomp" ? "lose fat while building muscle" : GOALS[p.goal]?.label;
   const out = await callClaude(
     [{ role: "user", content:
-      `Build today's "${focus}" workout. Access: ${ACCESS[profile.access]?.label}. Goal: ${GOALS[profile.goal]?.label}. 30–45 min, realistic, 4–6 exercises.` }],
+      `Build a "${focus}" workout for ${ACCESS[access]?.label} access. Goal: ${goalHint}. Pace: ${p.pace}. ~30–45 min, 4–6 exercises, realistic.` }],
     'You are a fitness coach. Reply with ONLY a JSON object, no prose: {"title":string,"type":"strength"|"cardio"|"mobility"|"run","duration_min":int,"exercises":[{"name":string,"detail":string}]}. "detail" is sets×reps or time. Keep the title close to the requested focus.',
     700);
   const j = parseLoose(out);
   if (!j || !Array.isArray(j.exercises)) throw new Error("bad");
-  return slotFrom({ title: j.title || focus, type: j.type || "strength", duration: j.duration_min || 40,
-    location: ACCESS[profile.access]?.label || "", exercises: j.exercises.slice(0, 8) }, profile.mainTime);
+  return { title: j.title || focus, focus, access, type: j.type || "strength",
+    duration: j.duration_min || 40, location: ACCESS[access]?.label || "", exercises: j.exercises.slice(0, 8) };
 }
-function slotFrom(s, time) {
-  return { id: uid(), time: time || "Lunch", done: false, title: s.title, type: s.type,
-    duration: Math.round(s.duration || 35), location: s.location || "",
-    exercises: (s.exercises || []).map((e) => ({ name: String(e.name || ""), detail: String(e.detail || "") })) };
+async function aiOrTemplate(p, access, focus, cache) {
+  const k = access + "|" + focus;
+  if (cache[k]) return cache[k];
+  try { cache[k] = await aiFocusWorkout(p, access, focus); }
+  catch (e) { cache[k] = templateSlot(access, focus); }
+  return cache[k];
 }
-function templatePrimary(profile, focus) {
-  const t = FOCUS_TEMPLATES[profile.access]?.[focus] || FOCUS_TEMPLATES.home["Full-body strength"];
-  return slotFrom({ title: focus, type: t.type, duration: t.duration,
-    location: ACCESS[profile.access]?.label || "", exercises: expand(t.ex) }, profile.mainTime);
-}
-function focusForDate(access, date) {
-  const arr = FOCUS[access] || FOCUS.home;
-  return arr[dayOfYear(date) % arr.length];
-}
-function buildTogether(profile, date) {
-  if (!profile.eveningTogether) return null;
+function togetherBase(date) {
   const t = TOGETHER_POOL[dayOfYear(date) % TOGETHER_POOL.length];
-  return { ...slotFrom({ title: t.title, type: t.type, duration: t.duration, location: t.location, exercises: expand(t.ex) }, "Evening"), together: true };
+  return { title: t.title, focus: "together", access: "together", type: t.type, duration: t.duration, location: t.location, exercises: expand(t.ex) };
+}
+function togetherOnDate(p, date) {
+  const mode = p.together?.mode || "none";
+  if (mode === "none") return false;
+  if (mode === "daily") return true;
+  const wd = new Date(date + "T00:00:00").getDay(); // 0 Sun .. 6 Sat
+  return wd === 1 || wd === 3 || wd === 6; // "few": Mon / Wed / Sat
+}
+
+/* ---------- week scheduling ---------- */
+function weekStartKey(d = new Date()) {
+  const x = new Date(d); const back = (x.getDay() + 6) % 7; // Monday start
+  x.setDate(x.getDate() - back); x.setHours(0, 0, 0, 0); return todayKey(x);
+}
+function weekDates(startKey) {
+  const s = new Date(startKey + "T00:00:00"); const out = [];
+  for (let i = 0; i < 7; i++) { const d = new Date(s); d.setDate(s.getDate() + i); out.push(todayKey(d)); }
+  return out;
+}
+// Build (or top up) a week of day-plans. force=true rebuilds every day;
+// otherwise existing days are kept (so edits and rest days survive). useAI
+// enriches with Claude, caching one call per unique (access, focus).
+async function buildWeekPlans(p, wkStart, prefs, existing = {}, opts = {}) {
+  const { force = false, useAI = false } = opts;
+  const dates = weekDates(wkStart);
+  const accesses = accessesOf(p);
+  const orderByAccess = {}; accesses.forEach((a) => (orderByAccess[a] = focusOrder(a, prefs)));
+  const n = p.sessionsPerDay === 2 ? 2 : 1;
+  const cache = {};
+  const out = {};
+  for (let di = 0; di < dates.length; di++) {
+    const dk = dates[di];
+    if (!force && existing[dk]) { out[dk] = existing[dk]; continue; }
+    const slots = [];
+    for (let i = 0; i < n; i++) {
+      const access = sessionAccess(accesses, i);
+      const order = orderByAccess[access] || ["Full-body strength"];
+      let focus = order[(di + i * (order.length > 1 ? 2 : 1)) % order.length];
+      if (slots.some((s) => s.focus === focus)) focus = order[(di + i + 3) % order.length];
+      const base = useAI ? await aiOrTemplate(p, access, focus, cache) : templateSlot(access, focus);
+      slots.push(placeSlot(base, i === 0 ? (p.mainTime || "Lunch") : (p.secondTime || "Evening")));
+    }
+    if (togetherOnDate(p, dk)) slots.push({ ...placeSlot(togetherBase(dk), p.together?.time || "Evening"), together: true });
+    out[dk] = { slots };
+  }
+  return out;
+}
+function bumpPref(prefs, focus, kind) {
+  const q = { like: { ...(prefs?.like || {}) }, skip: { ...(prefs?.skip || {}) } };
+  if (!focus || focus === "together") return q;
+  q[kind][focus] = (q[kind][focus] || 0) + 1;
+  return q;
 }
 
 /* ============================================================
@@ -407,8 +527,29 @@ function Choice({ options, value, onChange, columns = 1 }) {
     </div>
   );
 }
-function Avatar({ p, size = 36 }) {
-  return <div className="f-disp" style={{ width: size, height: size, borderRadius: size / 3, background: accentHex(p.accent),
+function MultiChoice({ options, values, onToggle, columns = 1 }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: `repeat(${columns},1fr)`, gap: 9 }}>
+      {options.map((o) => {
+        const sel = (values || []).includes(o.value);
+        return (
+          <button key={o.value} className="f-body" onClick={() => onToggle(o.value)}
+            style={{ textAlign: "left", padding: "12px 14px", borderRadius: 14, cursor: "pointer",
+              border: sel ? "2px solid " + INK : "1px solid #E2E6EC", background: sel ? "#11151C" : "#fff",
+              color: sel ? "#fff" : INK, transition: "all .12s" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+              {o.icon && <o.icon className="w-4 h-4" />}
+              <span style={{ fontWeight: 600, fontSize: 14 }}>{o.label}</span>
+              {sel && <Check className="w-4 h-4" style={{ marginLeft: "auto" }} />}
+            </div>
+            {o.desc && <div style={{ fontSize: 12, marginTop: 3, opacity: sel ? 0.8 : 0.6 }}>{o.desc}</div>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+function Avatar({ p, size = 36 }) {  return <div className="f-disp" style={{ width: size, height: size, borderRadius: size / 3, background: accentHex(p.accent),
     color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: size * 0.42, flexShrink: 0 }}>
     {(p.name || "?").trim().charAt(0).toUpperCase()}</div>;
 }
@@ -498,8 +639,9 @@ function Setup({ existing, onDone }) {
   const [p, setP] = useState({
     id: uid(), name: "", accent: existing.length ? "rose" : "sky", sex: "male",
     age: "", heightFt: "", heightIn: "", weightLb: "",
-    activity: "moderate", goal: "lose", pace: "standard",
-    access: "gym", mainTime: "Lunch", eveningTogether: true,
+    activity: "moderate", goal: "recomp", pace: "standard",
+    accesses: ["gym"], sessionsPerDay: 1, mainTime: "Lunch", secondTime: "Evening",
+    together: { mode: "few", time: "Evening" },
   });
   const set = (k, v) => setP((s) => ({ ...s, [k]: v }));
   const targets = computeTargets(p);
@@ -533,35 +675,67 @@ function Setup({ existing, onDone }) {
         <Field label="Weight"><TextInput type="number" inputMode="decimal" value={p.weightLb} placeholder="lbs" onChange={(e) => set("weightLb", e.target.value)} /></Field>
       </>
     ) },
-    { title: "How active are you?", valid: () => true, body: (
-      <Choice value={p.activity} onChange={(v) => set("activity", v)} options={Object.entries(ACT).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc }))} />
+    { title: "How active is your everyday life?", valid: () => true, body: (
+      <>
+        <p className="f-body" style={{ fontSize: 13.5, color: "#6B7280", margin: "-6px 0 14px", lineHeight: 1.5 }}>
+          This is about your normal day — job, walking, errands — <b>not</b> the workouts Tandem plans for you. It sets your baseline calorie burn.
+        </p>
+        <Choice value={p.activity} onChange={(v) => set("activity", v)} options={Object.entries(ACT).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc }))} />
+      </>
     ) },
     { title: "What's the goal?", valid: () => true, body: (
       <>
-        <Choice value={p.goal} onChange={(v) => set("goal", v)} options={Object.entries(GOALS).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc }))} />
+        <Choice value={p.goal} onChange={(v) => set("goal", v)} options={Object.entries(GOALS).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc }))} columns={2} />
         {p.goal !== "maintain" && (
-          <div style={{ marginTop: 14 }}>
+          <div style={{ marginTop: 16 }}>
             <Field label="Pace">
-              <Choice columns={2} value={p.pace} onChange={(v) => set("pace", v)} options={[
-                { value: "gentle", label: "Gentle", desc: p.goal === "lose" ? "~0.5 lb/wk" : "Slow & lean" },
-                { value: "standard", label: "Standard", desc: p.goal === "lose" ? "~1 lb/wk" : "Faster" }]} />
+              <Choice columns={3} value={p.pace} onChange={(v) => set("pace", v)} options={Object.entries(PACES).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc }))} />
             </Field>
+            {p.pace === "aggressive" && (
+              <div className="f-body" style={{ display: "flex", gap: 9, fontSize: 12.5, color: "#92400E", background: "#FEF3C7", borderRadius: 12, padding: "11px 13px", lineHeight: 1.5 }}>
+                <AlertTriangle className="w-4 h-4" style={{ flexShrink: 0, marginTop: 1, color: "#B45309" }} />
+                <span>Hardcore mode. Tandem will push the deficit/surplus hard — but never below a safe calorie floor. Faster isn't always better: watch your energy, sleep, and mood, and dial it back if they slip.</span>
+              </div>
+            )}
           </div>
         )}
       </>
     ) },
-    { title: "How do you train?", valid: () => true, body: (
+    { title: "How do you train?", valid: () => p.accesses.length > 0, body: (
       <>
-        <Field label="What do you have access to?">
-          <Choice value={p.access} onChange={(v) => set("access", v)} options={Object.entries(ACCESS).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc, icon: v.icon }))} />
+        <Field label="What do you have access to?" hint="Pick all that apply — Tandem mixes them across your week.">
+          <MultiChoice columns={1} values={p.accesses}
+            onToggle={(v) => { const has = p.accesses.includes(v); let next = has ? p.accesses.filter((a) => a !== v) : [...p.accesses, v]; if (!next.length) next = [v]; setP((s) => ({ ...s, accesses: next, access: next[0] })); }}
+            options={Object.entries(ACCESS).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc, icon: v.icon }))} />
         </Field>
-        <Field label="When do you usually train?">
+        <Field label="Sessions per day" hint="Two-a-day lets Tandem schedule, e.g., a gym lift in the morning and yoga or a walk later.">
+          <Choice columns={2} value={p.sessionsPerDay} onChange={(v) => set("sessionsPerDay", v)} options={[
+            { value: 1, label: "One a day" }, { value: 2, label: "Two a day" }]} />
+        </Field>
+        <Field label={p.sessionsPerDay === 2 ? "First session time" : "When do you usually train?"}>
           <Choice columns={2} value={p.mainTime} onChange={(v) => set("mainTime", v)} options={TIMES.map((t) => ({ value: t, label: t }))} />
         </Field>
-        <Field label="Add a shared evening activity?" hint="Rotates through a run, backyard Spartan circuit, yoga, a long walk, and more — and shows on both of your plans. You can always swap the day's pick.">
-          <Choice columns={2} value={p.eveningTogether ? "yes" : "no"} onChange={(v) => set("eveningTogether", v === "yes")}
-            options={[{ value: "yes", label: "Yes" }, { value: "no", label: "No" }]} />
-        </Field>
+        {p.sessionsPerDay === 2 && (
+          <Field label="Second session time">
+            <Choice columns={2} value={p.secondTime} onChange={(v) => set("secondTime", v)} options={TIMES.map((t) => ({ value: t, label: t }))} />
+          </Field>
+        )}
+      </>
+    ) },
+    { title: "Training together", valid: () => true, body: (
+      <>
+        <p className="f-body" style={{ fontSize: 13.5, color: "#6B7280", margin: "-6px 0 14px", lineHeight: 1.5 }}>
+          How often do you want a shared session with your partner? It rotates through a run, backyard Spartan circuit, yoga, a long walk, and more — and lands on both of your plans the same day.
+        </p>
+        <Choice value={p.together.mode} onChange={(v) => set("together", { ...p.together, mode: v })}
+          options={Object.entries(TOGETHER_MODES).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc }))} />
+        {p.together.mode !== "none" && (
+          <div style={{ marginTop: 14 }}>
+            <Field label="When?">
+              <Choice columns={2} value={p.together.time} onChange={(v) => set("together", { ...p.together, time: v })} options={TIMES.map((t) => ({ value: t, label: t }))} />
+            </Field>
+          </div>
+        )}
       </>
     ) },
     { title: "Your daily targets", valid: () => true, body: (
@@ -572,9 +746,15 @@ function Setup({ existing, onDone }) {
           <Metric big label="Water" value={targets.water_oz} unit="oz" color="#0EA5E9" />
           <Metric big label="Carbs / Fat" value={`${targets.carbs} / ${targets.fat}`} unit="g" color="#10B981" />
         </div>
+        {targets.warn && (
+          <div className="f-body" style={{ display: "flex", gap: 9, fontSize: 12.5, color: "#92400E", background: "#FEF3C7", borderRadius: 12, padding: "11px 13px", marginBottom: 12, lineHeight: 1.5 }}>
+            <AlertTriangle className="w-4 h-4" style={{ flexShrink: 0, marginTop: 1, color: "#B45309" }} />
+            <span>{targets.warn}</span>
+          </div>
+        )}
         <div className="f-body" style={{ fontSize: 12.5, color: "#7A828D", lineHeight: 1.5, background: "#F4F6F8", borderRadius: 12, padding: "11px 13px" }}>
           Built from the Mifflin–St Jeor equation and standard guidelines (BMR {targets.bmr} · maintenance ≈ {targets.tdee} kcal).
-          {targets.clamped ? " Floored to a safe minimum." : ""} It's a starting point — adjust to how you feel, and check with a doctor or dietitian for anything personalized.
+          {" "}It's a starting point — adjust to how you feel, and check with a doctor or dietitian for anything personalized.
         </div>
       </>
     ) },
@@ -593,7 +773,7 @@ function Setup({ existing, onDone }) {
             <Avatar p={ep} size={42} />
             <div style={{ textAlign: "left" }}>
               <div style={{ fontWeight: 600, color: INK }}>{ep.name}</div>
-              <div style={{ fontSize: 12.5, color: "#9097A1" }}>{GOALS[ep.goal]?.label} · {ACCESS[ep.access]?.label}</div>
+              <div style={{ fontSize: 12.5, color: "#9097A1" }}>{GOALS[ep.goal]?.label} · {accessesLabel(ep)}</div>
             </div>
             <ChevronRight className="w-5 h-5" style={{ marginLeft: "auto", color: "#C7CDD6" }} />
           </button>
@@ -886,77 +1066,147 @@ function SlotRow({ slot, accent, onToggle, onSub, onRemove, compact }) {
     </Card>
   );
 }
-function Train({ me, plan, onSave }) {
-  const [busy, setBusy] = useState(false);
-  const accent = accentHex(me.accent);
+function WeekDay({ dk, plan, isToday, accent, me, prefs, busy, on }) {
+  const [open, setOpen] = useState(isToday);
   const slots = plan?.slots || [];
-  const date = todayKey();
-  const focus = focusForDate(me.access, date);
-
-  async function generate() {
-    setBusy(true);
-    let main;
-    try { main = await aiFocusWorkout(me, focus); } catch (e) { main = templatePrimary(me, focus); }
-    const ev = buildTogether(me, date);
-    onSave({ slots: [...(main ? [main] : []), ...(ev ? [ev] : [])] });
-    setBusy(false);
-  }
-  async function swap(id) {
-    setBusy(true);
-    const cur = slots.find((s) => s.id === id);
-    let repl;
-    if (cur?.together) {
-      const others = TOGETHER_POOL.filter((t) => t.title !== cur.title);
-      const pick = others[Math.floor(Math.random() * others.length)];
-      repl = { ...slotFrom({ title: pick.title, type: pick.type, duration: pick.duration, location: pick.location, exercises: expand(pick.ex) }, "Evening"), together: true };
-    } else {
-      const others = (FOCUS[me.access] || FOCUS.home).filter((f) => f !== cur?.title);
-      const nf = others[Math.floor(Math.random() * others.length)];
-      try { repl = await aiFocusWorkout(me, nf); } catch (e) { repl = templatePrimary(me, nf); }
-    }
-    onSave({ slots: slots.map((s) => (s.id === id ? { ...repl, id, time: s.time, together: s.together } : s)) });
-    setBusy(false);
-  }
-  const toggle = (id) => onSave({ slots: slots.map((s) => (s.id === id ? { ...s, done: !s.done } : s)) });
-  const remove = (id) => onSave({ slots: slots.filter((s) => s.id !== id) });
-  const reschedule = (id, time) => onSave({ slots: slots.map((s) => (s.id === id ? { ...s, time } : s)) });
-  const doneCt = slots.filter((s) => s.done).length;
-
+  const done = slots.filter((s) => s.done).length;
+  const exists = !!plan; // a saved (possibly empty / rest) day
+  const wname = new Date(dk + "T00:00:00").toLocaleDateString(undefined, { weekday: "short" });
   return (
-    <Screen>
-      <Header me={me} title="Train" subtitle={`${ACCESS[me.access]?.label} · today's focus: ${focus}`} />
-      {slots.length === 0 ? (
-        <Card style={{ textAlign: "center", padding: 28 }}>
-          <div style={{ width: 56, height: 56, borderRadius: 18, background: accent + "1a", margin: "0 auto 14px", display: "flex", alignItems: "center", justifyContent: "center" }}><Dumbbell className="w-7 h-7" style={{ color: accent }} /></div>
-          <h3 className="f-disp" style={{ fontSize: 19, fontWeight: 700, color: INK, margin: "0 0 6px" }}>Today is {focus.toLowerCase()}</h3>
-          <p className="f-body" style={{ fontSize: 14, color: "#6B7280", margin: "0 0 18px" }}>
-            Tailored to your {ACCESS[me.access]?.label.toLowerCase()} access{me.eveningTogether ? ", plus tonight's shared activity" : ""}. The focus rotates daily, so no two days repeat.</p>
-          <Btn full size="lg" color={accent} disabled={busy} onClick={generate}>
-            {busy ? <RefreshCw className="w-5 h-5" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-5 h-5" />}{busy ? "Building…" : "Generate today's plan"}</Btn>
-        </Card>
-      ) : (
-        <>
-          <Card style={{ display: "flex", alignItems: "center", gap: 14 }}>
-            <Ring value={slots.length ? doneCt / slots.length : 0} color={accent} size={58}><span className="f-disp tnum" style={{ fontSize: 15, fontWeight: 700, color: INK }}>{doneCt}/{slots.length}</span></Ring>
-            <div style={{ flex: 1 }}>
-              <div className="f-body" style={{ fontWeight: 600, color: INK, fontSize: 15 }}>{doneCt === slots.length ? "Crushed it today 💪" : "Sessions done"}</div>
-              <div className="f-body" style={{ fontSize: 12.5, color: "#9097A1" }}>Tap a circle to check one off.</div>
-            </div>
-            <Btn kind="soft" color={accent} size="sm" disabled={busy} onClick={generate}><RefreshCw className="w-3.5 h-3.5" /> Redo</Btn>
-          </Card>
+    <Card style={{ padding: 0, overflow: "hidden", borderColor: isToday ? accent + "66" : "#EBEEF2" }}>
+      <button onClick={() => setOpen(!open)} className="f-body"
+        style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, padding: "13px 15px", background: "none", border: "none", cursor: "pointer", textAlign: "left" }}>
+        <div style={{ width: 42 }}>
+          <div className="f-disp" style={{ fontSize: 13, fontWeight: 700, color: isToday ? accent : INK }}>{wname}</div>
+          <div className="f-body" style={{ fontSize: 11, color: "#9097A1" }}>{fmtDate(dk)}</div>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {slots.length === 0
+            ? <span className="f-body" style={{ fontSize: 13, color: "#A6ACB5" }}>{exists ? "Rest day" : "—"}</span>
+            : <div className="f-body" style={{ fontSize: 13, color: INK, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {slots.map((s) => s.title).join("  ·  ")}
+              </div>}
+        </div>
+        {isToday && <span className="f-body" style={{ fontSize: 10, fontWeight: 700, color: "#fff", background: accent, padding: "2px 7px", borderRadius: 6 }}>TODAY</span>}
+        {slots.length > 0 && <span className="f-disp tnum" style={{ fontSize: 12, color: done === slots.length ? "#10B981" : "#9097A1" }}>{done}/{slots.length}</span>}
+        <ChevronDown className="w-4 h-4" style={{ color: "#C7CDD6", transform: open ? "rotate(180deg)" : "none", transition: "transform .2s" }} />
+      </button>
+      {open && (
+        <div style={{ padding: "0 12px 12px" }}>
           {slots.map((sl) => (
             <div key={sl.id}>
-              <SlotRow slot={sl} accent={accent} onToggle={toggle} onSub={swap} onRemove={remove} />
+              <SlotRow slot={sl} accent={accent} onToggle={(id) => on.toggle(dk, id)} onSub={(id) => on.swap(dk, id)} onRemove={(id) => on.remove(dk, id)} />
               <div style={{ display: "flex", gap: 6, margin: "-6px 0 12px 4px", flexWrap: "wrap" }}>
                 {TIMES.map((tm) => (
-                  <button key={tm} onClick={() => reschedule(sl.id, tm)} className="f-body" style={{ fontSize: 11.5, padding: "4px 9px", borderRadius: 8, cursor: "pointer",
+                  <button key={tm} onClick={() => on.reschedule(dk, sl.id, tm)} className="f-body" style={{ fontSize: 11.5, padding: "4px 9px", borderRadius: 8, cursor: "pointer",
                     border: "1px solid " + (sl.time === tm ? accent : "#E5E8EC"), background: sl.time === tm ? accent + "14" : "#fff", color: sl.time === tm ? accent : "#9097A1", fontWeight: 600 }}>{tm}</button>
                 ))}
               </div>
             </div>
           ))}
-        </>
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <Btn kind="outline" size="sm" disabled={busy} onClick={() => on.addSession(dk)}><Plus className="w-3.5 h-3.5" /> Add session</Btn>
+            {slots.length > 0 && <Btn kind="outline" size="sm" disabled={busy} onClick={() => on.restDay(dk)}>Rest day</Btn>}
+          </div>
+        </div>
       )}
+    </Card>
+  );
+}
+function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref }) {
+  const [busy, setBusy] = useState(false);
+  const accent = accentHex(me.accent);
+  const aiOn = !!AI_PROXY;
+  const today = todayKey();
+  const plans = week?.plans || {};
+  const dates = week?.dates || weekDates(weekStartKey());
+
+  async function buildOne(access, focus) {
+    if (aiOn) { try { return await aiFocusWorkout(me, access, focus); } catch (e) { return templateSlot(access, focus); } }
+    return templateSlot(access, focus);
+  }
+  const on = {
+    toggle(dk, id) {
+      const plan = plans[dk] || { slots: [] };
+      const slot = plan.slots.find((s) => s.id === id);
+      if (slot && !slot.done) onPref(slot.focus, "like");
+      onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? { ...s, done: !s.done } : s)) });
+    },
+    remove(dk, id) {
+      const plan = plans[dk] || { slots: [] };
+      const slot = plan.slots.find((s) => s.id === id);
+      if (slot) onPref(slot.focus, "skip");
+      onSaveDay(dk, { slots: plan.slots.filter((s) => s.id !== id) });
+    },
+    reschedule(dk, id, time) {
+      const plan = plans[dk] || { slots: [] };
+      onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? { ...s, time } : s)) });
+    },
+    restDay(dk) { onSaveDay(dk, { slots: [] }); },
+    async swap(dk, id) {
+      const plan = plans[dk] || { slots: [] };
+      const cur = plan.slots.find((s) => s.id === id); if (!cur) return;
+      setBusy(true);
+      let repl;
+      if (cur.together) {
+        const others = TOGETHER_POOL.filter((t) => t.title !== cur.title);
+        const pick = others[Math.floor(Math.random() * others.length)];
+        repl = { ...placeSlot({ title: pick.title, focus: "together", access: "together", type: pick.type, duration: pick.duration, location: pick.location, exercises: expand(pick.ex) }, cur.time), together: true };
+      } else {
+        onPref(cur.focus, "skip");
+        const order = focusOrder(cur.access, prefs).filter((f) => f !== cur.focus);
+        const nf = order[Math.floor(Math.random() * order.length)] || cur.focus;
+        repl = placeSlot(await buildOne(cur.access, nf), cur.time);
+      }
+      onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? repl : s)) });
+      setBusy(false);
+    },
+    async addSession(dk) {
+      const plan = plans[dk] || { slots: [] };
+      setBusy(true);
+      const accesses = accessesOf(me);
+      const idx = plan.slots.filter((s) => !s.together).length;
+      const access = sessionAccess(accesses, idx);
+      const used = new Set(plan.slots.map((s) => s.focus));
+      const order = focusOrder(access, prefs);
+      const nf = order.find((f) => !used.has(f)) || order[0];
+      const time = idx === 0 ? (me.mainTime || "Lunch") : (me.secondTime || "Evening");
+      onSaveDay(dk, { slots: [...plan.slots, placeSlot(await buildOne(access, nf), time)] });
+      setBusy(false);
+    },
+  };
+  async function gen(useAI) { setBusy(true); await onGenWeek(useAI); setBusy(false); }
+
+  let wkDone = 0, wkTotal = 0;
+  dates.forEach((d) => { const s = plans[d]?.slots || []; wkDone += s.filter((x) => x.done).length; wkTotal += s.length; });
+
+  return (
+    <Screen>
+      <Header me={me} title="Train" subtitle={`${accessesLabel(me)} · ${me.sessionsPerDay === 2 ? "2 sessions/day" : "1 session/day"}`} />
+      <Card>
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          <Ring value={wkTotal ? wkDone / wkTotal : 0} color={accent} size={56}><span className="f-disp tnum" style={{ fontSize: 13, fontWeight: 700, color: INK }}>{wkDone}/{wkTotal}</span></Ring>
+          <div style={{ flex: 1 }}>
+            <div className="f-body" style={{ fontWeight: 600, color: INK, fontSize: 15 }}>This week</div>
+            <div className="f-body" style={{ fontSize: 12.5, color: "#9097A1" }}>Auto-built and rotating. Tap any day to tweak it.</div>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+          {aiOn
+            ? <Btn full color={VIOLET} size="sm" disabled={busy} onClick={() => gen(true)}>
+                {busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-4 h-4" />} Generate week with AI
+              </Btn>
+            : <Btn full color={accent} size="sm" disabled={busy} onClick={() => gen(false)}>
+                {busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <RefreshCw className="w-4 h-4" />} Rebuild week
+              </Btn>}
+        </div>
+        {!aiOn && <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 8 }}>Turn on AI (see setup) and Tandem will write each week's workouts for you — and learn what you keep vs. skip.</div>}
+        {aiOn && <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 8 }}>AI learns from what you finish vs. swap away, and leans your week toward what you like.</div>}
+      </Card>
+
+      {dates.map((dk) => (
+        <WeekDay key={dk} dk={dk} plan={plans[dk]} isToday={dk === today} accent={accent} me={me} prefs={prefs} busy={busy} on={on} />
+      ))}
       <div style={{ height: 8 }} />
     </Screen>
   );
@@ -1231,7 +1481,7 @@ function SettingsView({ me, onEdit, onSwitch }) {
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
           <Avatar p={me} size={48} />
           <div><div className="f-body" style={{ fontWeight: 600, fontSize: 16, color: INK }}>{me.name}</div>
-            <div className="f-body" style={{ fontSize: 13, color: "#9097A1" }}>{GOALS[me.goal]?.label} · {ACT[me.activity]?.label} · {ACCESS[me.access]?.label}</div></div>
+            <div className="f-body" style={{ fontSize: 13, color: "#9097A1" }}>{GOALS[me.goal]?.label} · {accessesLabel(me)} · {me.sessionsPerDay === 2 ? "2/day" : "1/day"}</div></div>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
           <Metric label="Calories" value={t.calories} unit="kcal" color={accentHex(me.accent)} />
@@ -1300,6 +1550,8 @@ export default function App() {
   const [partnerStats, setPartnerStats] = useState(null);
   const [progress, setProgress] = useState(null);
   const [progressBusy, setProgressBusy] = useState(false);
+  const [myWeek, setMyWeek] = useState(null);
+  const [prefs, setPrefs] = useState(null);
 
   const date = todayKey();
   const me = meId ? profiles[meId] : null;
@@ -1309,7 +1561,7 @@ export default function App() {
   const loadProfiles = useCallback(async () => {
     const keys = await store.list("profile:", true);
     const obj = {};
-    for (const k of keys) { const id = k.replace("profile:", ""); const pr = await getJSON(k, true); if (pr) obj[id] = pr; }
+    for (const k of keys) { const id = k.replace("profile:", ""); const pr = await getJSON(k, true); if (pr) obj[id] = migrate(pr); }
     setProfiles(obj); return obj;
   }, []);
 
@@ -1346,6 +1598,28 @@ export default function App() {
     setProgressBusy(false);
   }, []);
 
+  const loadWeek = useCallback(async (prof, pf) => {
+    if (!prof) return;
+    const wk = weekStartKey();
+    const dates = weekDates(wk);
+    const existing = {};
+    for (const dk of dates) { const pl = await getJSON(`plan:${prof.id}:${dk}`, true); if (pl) existing[dk] = pl; }
+    let plans = existing;
+    if (dates.some((d) => !existing[d])) {
+      // Auto-fill any not-yet-planned day with rotating templates (instant, no AI).
+      const built = await buildWeekPlans(prof, wk, pf || { like: {}, skip: {} }, existing, { force: false, useAI: false });
+      for (const dk of dates) if (!existing[dk]) await store.set(`plan:${prof.id}:${dk}`, built[dk], true);
+      plans = built;
+    }
+    setMyWeek({ weekStart: wk, dates, plans });
+    if (plans[todayKey()]) setMyPlan(plans[todayKey()]);
+  }, []);
+
+  const loadPrefs = useCallback(async (mid) => {
+    const pf = (await getJSON(`prefs:${mid}`, true)) || { like: {}, skip: {} };
+    setPrefs(pf); return pf;
+  }, []);
+
   useEffect(() => {
     (async () => {
       const obj = await loadProfiles();
@@ -1353,10 +1627,12 @@ export default function App() {
       if (saved && obj[saved]) {
         setMeId(saved);
         await loadData(saved, Object.keys(obj).find((id) => id !== saved));
+        const pf = await loadPrefs(saved);
+        await loadWeek(obj[saved], pf);
       }
       setBooted(true);
     })();
-  }, [loadProfiles, loadData]);
+  }, [loadProfiles, loadData, loadPrefs, loadWeek]);
 
   useEffect(() => {
     if (!meId) return;
@@ -1381,12 +1657,36 @@ export default function App() {
     const obj = await loadProfiles();
     setMeId(profile.id);
     await loadData(profile.id, Object.keys(obj).find((id) => id !== profile.id));
+    const pf = await loadPrefs(profile.id);
+    await loadWeek(obj[profile.id] || profile, pf);
     setTab("today");
   }
   async function saveMyLog(next) { setMyLog(next); await store.set(`log:${meId}:${date}`, next, true); }
   async function saveMyPlan(next) { setMyPlan(next); await store.set(`plan:${meId}:${date}`, next, true); }
   async function sendNudge(text) { if (partnerId) await store.set(`nudge:${partnerId}`, { from: meId, text, ts: Date.now() }, true); }
   async function clearNudge() { setNudge(null); await store.del(`nudge:${meId}`, true); }
+
+  async function saveDay(dk, plan) {
+    await store.set(`plan:${meId}:${dk}`, plan, true);
+    setMyWeek((w) => (w ? { ...w, plans: { ...w.plans, [dk]: plan } } : w));
+    if (dk === date) setMyPlan(plan);
+  }
+  async function regenWeek(prof, useAI) {
+    const who = prof || me;
+    const pf = prefs || (await getJSON(`prefs:${who.id}`, true)) || { like: {}, skip: {} };
+    const wk = weekStartKey();
+    const dates = weekDates(wk);
+    const built = await buildWeekPlans(who, wk, pf, {}, { force: true, useAI });
+    for (const dk of dates) await store.set(`plan:${who.id}:${dk}`, built[dk], true);
+    setMyWeek({ weekStart: wk, dates, plans: built });
+    if (built[todayKey()]) setMyPlan(built[todayKey()]);
+  }
+  async function genWeek(useAI) { await regenWeek(me, useAI); }
+  async function bumpPreference(focus, kind) {
+    const pf = bumpPref(prefs, focus, kind);
+    setPrefs(pf);
+    await store.set(`prefs:${meId}`, pf, true);
+  }
 
   async function logWeight(lb) {
     const arr = (await getJSON(`weights:${meId}`, true)) || [];
@@ -1433,7 +1733,7 @@ export default function App() {
   );
   if (editing) return (
     <div style={{ minHeight: "100vh", background: BG }}><StyleInjector />
-      <EditProfile me={me} onDone={async (np) => { await store.set(`profile:${np.id}`, np, true); await loadProfiles(); setEditing(false); }} onCancel={() => setEditing(false)} />
+      <EditProfile me={me} onDone={async (np) => { await store.set(`profile:${np.id}`, np, true); const obj = await loadProfiles(); await regenWeek(obj[np.id] || np, false); setEditing(false); }} onCancel={() => setEditing(false)} />
     </div>
   );
 
@@ -1442,7 +1742,7 @@ export default function App() {
       <StyleInjector />
       {tab === "today" && <Today me={me} partner={partner} myLog={myLog} partnerLog={partnerLog} myPlan={myPlan} partnerPlan={partnerPlan} myStats={myStats} nudge={nudge} onClearNudge={clearNudge} onGo={setTab} />}
       {tab === "food" && <Food me={me} log={myLog} onSave={saveMyLog} />}
-      {tab === "train" && <Train me={me} plan={myPlan} onSave={saveMyPlan} />}
+      {tab === "train" && <Train me={me} week={myWeek} prefs={prefs} onSaveDay={saveDay} onGenWeek={genWeek} onPref={bumpPreference} />}
       {tab === "progress" && <Progress me={me} data={progress} busy={progressBusy} onLogWeight={logWeight} onLogMeasure={logMeasure} onAddPhoto={addPhoto} onDeletePhoto={deletePhoto} />}
       {tab === "us" && <Us me={me} partner={partner} myLog={myLog} partnerLog={partnerLog} myPlan={myPlan} partnerPlan={partnerPlan} myStats={myStats} partnerStats={partnerStats} onNudge={sendNudge} />}
       {tab === "settings" && <SettingsView me={me} onEdit={() => setEditing(true)} onSwitch={async () => { device.del(); setMeId(null); setForceSetup(true); }} />}
@@ -1465,9 +1765,10 @@ export default function App() {
 }
 
 function EditProfile({ me, onDone, onCancel }) {
-  const [p, setP] = useState({ ...me });
+  const [p, setP] = useState({ ...me, accesses: accessesOf(me), sessionsPerDay: me.sessionsPerDay || 1, together: me.together || { mode: "few", time: "Evening" } });
   const set = (k, v) => setP((s) => ({ ...s, [k]: v }));
   const targets = computeTargets(p);
+  const toggleAccess = (v) => { const has = p.accesses.includes(v); let next = has ? p.accesses.filter((a) => a !== v) : [...p.accesses, v]; if (!next.length) next = [v]; setP((s) => ({ ...s, accesses: next, access: next[0] })); };
   return (
     <SetupShell>
       <div style={{ display: "flex", alignItems: "center", marginBottom: 16 }}>
@@ -1475,11 +1776,28 @@ function EditProfile({ me, onDone, onCancel }) {
         <button onClick={onCancel} style={{ marginLeft: "auto", background: "none", border: "none", cursor: "pointer" }}><X className="w-5 h-5" style={{ color: "#9097A1" }} /></button>
       </div>
       <Field label="Name"><TextInput value={p.name} onChange={(e) => set("name", e.target.value)} /></Field>
-      <Field label="Weight (lbs)" hint="Logging a weigh-in on the Progress tab updates this automatically."><TextInput type="number" value={p.weightLb} onChange={(e) => set("weightLb", e.target.value)} /></Field>
-      <Field label="Activity"><Choice value={p.activity} onChange={(v) => set("activity", v)} options={Object.entries(ACT).map(([k, v]) => ({ value: k, label: v.label }))} columns={2} /></Field>
-      <Field label="Goal"><Choice value={p.goal} onChange={(v) => set("goal", v)} options={Object.entries(GOALS).map(([k, v]) => ({ value: k, label: v.label }))} columns={3} /></Field>
-      <Field label="Training access"><Choice value={p.access} onChange={(v) => set("access", v)} options={Object.entries(ACCESS).map(([k, v]) => ({ value: k, label: v.label }))} columns={3} /></Field>
-      <Field label="Shared evening activity"><Choice columns={2} value={p.eveningTogether ? "yes" : "no"} onChange={(v) => set("eveningTogether", v === "yes")} options={[{ value: "yes", label: "Yes" }, { value: "no", label: "No" }]} /></Field>
+      <Field label="Weight (lbs)" hint="A weigh-in on the Progress tab updates this automatically."><TextInput type="number" value={p.weightLb} onChange={(e) => set("weightLb", e.target.value)} /></Field>
+      <Field label="Everyday activity" hint="Your normal day — not Tandem's workouts."><Choice value={p.activity} onChange={(v) => set("activity", v)} options={Object.entries(ACT).map(([k, v]) => ({ value: k, label: v.label }))} columns={2} /></Field>
+      <Field label="Goal"><Choice value={p.goal} onChange={(v) => set("goal", v)} options={Object.entries(GOALS).map(([k, v]) => ({ value: k, label: v.label, desc: v.desc }))} columns={2} /></Field>
+      {p.goal !== "maintain" && (
+        <Field label="Pace"><Choice columns={3} value={p.pace} onChange={(v) => set("pace", v)} options={Object.entries(PACES).map(([k, v]) => ({ value: k, label: v.label }))} /></Field>
+      )}
+      <Field label="Training access" hint="Pick all that apply."><MultiChoice columns={1} values={p.accesses} onToggle={toggleAccess} options={Object.entries(ACCESS).map(([k, v]) => ({ value: k, label: v.label, icon: v.icon }))} /></Field>
+      <Field label="Sessions per day"><Choice columns={2} value={p.sessionsPerDay} onChange={(v) => set("sessionsPerDay", v)} options={[{ value: 1, label: "One a day" }, { value: 2, label: "Two a day" }]} /></Field>
+      {p.sessionsPerDay === 2 && (
+        <Field label="Session times">
+          <div style={{ display: "flex", gap: 8 }}>
+            <Choice columns={2} value={p.mainTime} onChange={(v) => set("mainTime", v)} options={TIMES.map((t) => ({ value: t, label: t }))} />
+            <Choice columns={2} value={p.secondTime} onChange={(v) => set("secondTime", v)} options={TIMES.map((t) => ({ value: t, label: t }))} />
+          </div>
+        </Field>
+      )}
+      <Field label="Training together"><Choice value={p.together.mode} onChange={(v) => set("together", { ...p.together, mode: v })} options={Object.entries(TOGETHER_MODES).map(([k, v]) => ({ value: k, label: v.label }))} columns={3} /></Field>
+      {targets.warn && (
+        <div className="f-body" style={{ display: "flex", gap: 9, fontSize: 12.5, color: "#92400E", background: "#FEF3C7", borderRadius: 12, padding: "11px 13px", marginBottom: 12, lineHeight: 1.5 }}>
+          <AlertTriangle className="w-4 h-4" style={{ flexShrink: 0, marginTop: 1, color: "#B45309" }} /><span>{targets.warn}</span>
+        </div>
+      )}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, margin: "8px 0 16px" }}>
         <Metric label="Calories" value={targets.calories} unit="kcal" color={accentHex(p.accent)} />
         <Metric label="Protein" value={targets.protein} unit="g" color={VIOLET} />
