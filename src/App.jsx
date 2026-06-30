@@ -75,6 +75,20 @@ const CUSTOM_TYPES = [
   { key: "mobility", label: "Yoga / mobility" }, { key: "other", label: "Other" },
 ];
 const mealForNow = () => { const h = new Date().getHours(); return h < 11 ? "breakfast" : h < 16 ? "lunch" : h < 21 ? "dinner" : "snacks"; };
+const VESSELS = [
+  { label: "Stanley", oz: 30 },
+  { label: "Yeti", oz: 26 },
+  { label: "Owala", oz: 24 },
+];
+const GLASS = [8, 12, 16];
+const POSES = [
+  { key: "front", label: "Front" },
+  { key: "side", label: "Side" },
+  { key: "back", label: "Back" },
+];
+const CHECKIN_DAYS = 7;
+const isDue = (ts) => !ts || Date.now() - ts >= CHECKIN_DAYS * 86400000;
+const daysSince = (ts) => (ts ? Math.floor((Date.now() - ts) / 86400000) : null);
 
 /* ---------- workout content (rotating split + together pool) ---------- */
 const FOCUS = {
@@ -256,7 +270,7 @@ function streakBack(history, ok, allowPending = true) {
   }
   return s;
 }
-function computeStats(history, weights) {
+function computeStats(history, weights, measures, photoIdx) {
   const dryStreak = streakBack(history, (d) => (d.log?.alcohol?.length || 0) === 0, false);
   const workoutStreak = streakBack(history, (d) => (d.plan?.slots || []).some((s) => s.done));
   const logStreak = streakBack(history, (d) =>
@@ -269,7 +283,10 @@ function computeStats(history, weights) {
     const old = weights.find((w) => w.ts >= cutoff) || weights[0];
     weightChange30 = +(weight - old.lb).toFixed(1);
   }
-  return { dryStreak, workoutStreak, logStreak, weight, weightChange30, ts: Date.now() };
+  const lastWeighTs = weights?.length ? weights[weights.length - 1].ts : 0;
+  const lastMeasureTs = measures?.length ? measures[measures.length - 1].ts : 0;
+  const lastPhotoTs = photoIdx?.length ? Math.max(...photoIdx.map((p) => p.ts || 0)) : 0;
+  return { dryStreak, workoutStreak, logStreak, weight, weightChange30, lastWeighTs, lastMeasureTs, lastPhotoTs, ts: Date.now() };
 }
 
 /* ---------- AI ---------- */
@@ -930,6 +947,7 @@ function Food({ me, log, onSave }) {
   const [draft, setDraft] = useState(null);  // { label, cal, p, c, f, meal }
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [cw, setCw] = useState("");
   const fileRef = useRef(null);
   const food = log?.food || [], alcohol = log?.alcohol || [];
   const aiOn = !!AI_PROXY;
@@ -973,8 +991,22 @@ function Food({ me, log, onSave }) {
           </div>
           {tot.water > 0 && <button onClick={() => addWater(-8)} style={{ background: "#F1F3F6", border: "none", borderRadius: 10, padding: 8, cursor: "pointer" }}><Minus className="w-4 h-4" style={{ color: "#6B7280" }} /></button>}
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 9 }}>
-          {[["Glass", 8], ["Bottle", 16], ["Big", 24]].map(([l, oz]) => <Btn key={l} kind="soft" color="#0EA5E9" size="sm" onClick={() => addWater(oz)}><Plus className="w-3.5 h-3.5" /> {oz}oz</Btn>)}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          {VESSELS.map((v) => (
+            <Btn key={v.label} kind="soft" color="#0EA5E9" size="sm" onClick={() => addWater(v.oz)}>
+              <span style={{ display: "flex", flexDirection: "column", alignItems: "center", lineHeight: 1.15 }}>
+                <span style={{ fontWeight: 700 }}>{v.label}</span>
+                <span style={{ fontSize: 10.5, opacity: 0.85 }}>{v.oz} oz</span>
+              </span>
+            </Btn>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+          {GLASS.map((oz) => (
+            <button key={oz} onClick={() => addWater(oz)} className="f-body" style={{ flex: "0 0 auto", fontSize: 12.5, fontWeight: 600, padding: "9px 12px", borderRadius: 11, border: "1px solid #DCEBF5", background: "#fff", color: "#0EA5E9", cursor: "pointer" }}>+{oz}</button>
+          ))}
+          <input className="f-body tnum" type="number" inputMode="numeric" value={cw} placeholder="oz" onChange={(e) => setCw(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && +cw) { addWater(+cw); setCw(""); } }} style={{ ...inputStyle, flex: 1, minWidth: 0, padding: "9px 10px", textAlign: "center" }} />
+          <Btn kind="soft" color="#0EA5E9" size="sm" disabled={!+cw} onClick={() => { addWater(+cw); setCw(""); }}><Plus className="w-3.5 h-3.5" /></Btn>
         </div>
       </Card>
 
@@ -1397,6 +1429,47 @@ function ChangeTag({ delta, suffix = " lb" }) {
     </span>
   );
 }
+function BodyDiagram({ latestM, measures, accent }) {
+  const firstOf = (k) => { for (const m of (measures || [])) if (m[k] != null) return m[k]; return null; };
+  const PTS = [
+    { key: "chest", label: "Chest", y: 96, mx: 108, side: "left" },
+    { key: "arms", label: "Arm", y: 120, mx: 170, side: "right" },
+    { key: "waist", label: "Waist", y: 134, mx: 114, side: "left" },
+    { key: "hips", label: "Hips", y: 162, mx: 150, side: "right" },
+    { key: "thighs", label: "Thigh", y: 222, mx: 120, side: "left" },
+  ];
+  const stroke = accent + "70", fill = accent + "1c";
+  return (
+    <svg viewBox="0 0 260 330" style={{ width: "100%", maxWidth: 300, display: "block", margin: "2px auto 0" }}>
+      <g fill={fill} stroke={stroke} strokeWidth="1.6" strokeLinejoin="round">
+        <circle cx="130" cy="32" r="18" />
+        <path d="M114,52 L146,52 Q156,54 154,64 L150,120 Q149,134 142,152 L118,152 Q111,134 110,120 L106,64 Q104,54 114,52 Z" />
+        <rect x="92" y="62" width="13" height="76" rx="6.5" transform="rotate(7 98 100)" />
+        <rect x="155" y="62" width="13" height="76" rx="6.5" transform="rotate(-7 162 100)" />
+        <rect x="115" y="150" width="13" height="150" rx="6.5" />
+        <rect x="132" y="150" width="13" height="150" rx="6.5" />
+      </g>
+      {PTS.map((p) => {
+        const v = latestM && latestM[p.key] != null ? latestM[p.key] : null;
+        const f = firstOf(p.key);
+        const d = v != null && f != null ? +(v - f).toFixed(1) : null;
+        const gutterX = p.side === "left" ? 66 : 194;
+        const labelX = p.side === "left" ? 6 : 254;
+        const anchor = p.side === "left" ? "start" : "end";
+        return (
+          <g key={p.key}>
+            <line x1={p.mx} y1={p.y} x2={gutterX} y2={p.y} stroke="#D8DCE2" strokeWidth="1" strokeDasharray="2 2" />
+            <circle cx={p.mx} cy={p.y} r="3.4" fill={accent} />
+            <text x={labelX} y={p.y - 3} textAnchor={anchor} className="f-body" style={{ fontSize: 11, fontWeight: 600, fill: "#6B7280" }}>{p.label}</text>
+            <text x={labelX} y={p.y + 12} textAnchor={anchor} className="f-disp" style={{ fontSize: 13, fontWeight: 700, fill: v != null ? INK : "#C7CDD6" }}>
+              {v != null ? v + "″" : "—"}{d != null && Math.abs(d) >= 0.1 ? `  ${d > 0 ? "+" : ""}${d}` : ""}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
 function Progress({ me, data, busy, onLogWeight, onLogMeasure, onAddPhoto, onDeletePhoto }) {
   const [showW, setShowW] = useState(false);
   const [showM, setShowM] = useState(false);
@@ -1404,14 +1477,18 @@ function Progress({ me, data, busy, onLogWeight, onLogMeasure, onAddPhoto, onDel
   const [mVals, setMVals] = useState({});
   const [viewer, setViewer] = useState(null);
   const fileRef = useRef(null);
+  const poseRef = useRef("front");
   if (!data) return <Screen><Header me={me} title="Progress" /><Card><div className="f-body" style={{ textAlign: "center", color: "#9097A1", padding: 12 }}>Loading…</div></Card></Screen>;
 
   const { weights, measures, photoIdx, images, history, stats } = data;
+  const accent = accentHex(me.accent);
   const weightVals = weights.map((w) => w.lb);
   const latestW = weights.length ? weights[weights.length - 1].lb : null;
   const waistSeries = measures.filter((m) => m.waist != null).map((m) => m.waist);
   const latestM = measures.length ? measures[measures.length - 1] : null;
   const days = history.slice(0, 7).reverse();
+  const dueWeigh = isDue(stats.lastWeighTs), dueMeasure = isDue(stats.lastMeasureTs), duePhoto = isDue(stats.lastPhotoTs);
+  const anyDue = dueWeigh || dueMeasure || duePhoto;
 
   function saveW() { const v = parseFloat(wVal); if (!v) return; onLogWeight(v); setWVal(""); setShowW(false); }
   function saveM() {
@@ -1419,11 +1496,28 @@ function Progress({ me, data, busy, onLogWeight, onLogMeasure, onAddPhoto, onDel
     MEASURE_FIELDS.forEach((f) => { const v = parseFloat(mVals[f.key]); if (v) { obj[f.key] = v; any = true; } });
     if (!any) return; onLogMeasure(obj); setMVals({}); setShowM(false);
   }
-  function onFile(e) { const f = e.target.files?.[0]; if (f) onAddPhoto(f); e.target.value = ""; }
+  function onFile(e) { const f = e.target.files?.[0]; if (f) onAddPhoto(f, poseRef.current); e.target.value = ""; }
+  function pickPhoto(pose) { poseRef.current = pose; fileRef.current?.click(); }
 
   return (
     <Screen>
       <Header me={me} title="Progress" subtitle="Streaks, trends & photos" />
+      {anyDue && (
+        <Card style={{ borderColor: accent + "55", background: accent + "0d" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 11, marginBottom: 12 }}>
+            <div style={{ width: 38, height: 38, borderRadius: 11, background: accent + "1f", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><CalendarDays className="w-5 h-5" style={{ color: accent }} /></div>
+            <div>
+              <div className="f-body" style={{ fontWeight: 700, color: INK, fontSize: 14.5 }}>Weekly check-in</div>
+              <div className="f-body" style={{ fontSize: 12.5, color: "#7A828D" }}>A quick update keeps your trends honest.</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {dueWeigh && <Btn size="sm" color={accent} onClick={() => { setShowW(true); setShowM(false); }}><Scale className="w-3.5 h-3.5" /> Weigh in{daysSince(stats.lastWeighTs) != null ? ` · ${daysSince(stats.lastWeighTs)}d` : ""}</Btn>}
+            {dueMeasure && <Btn size="sm" kind="soft" color={accent} onClick={() => { setShowM(true); setShowW(false); }}><Ruler className="w-3.5 h-3.5" /> Measure</Btn>}
+            {duePhoto && <Btn size="sm" kind="soft" color={accent} onClick={() => pickPhoto("front")}><Camera className="w-3.5 h-3.5" /> Photo</Btn>}
+          </div>
+        </Card>
+      )}
       {/* streaks */}
       <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
         <StreakPill icon={Flame} n={stats.workoutStreak} label="workout streak" color="#F59E0B" />
@@ -1503,45 +1597,52 @@ function Progress({ me, data, busy, onLogWeight, onLogMeasure, onAddPhoto, onDel
             <Btn full size="sm" color={accentHex(me.accent)} onClick={saveM}><Check className="w-4 h-4" /> Save measurements</Btn>
           </div>
         )}
-        {latestM ? (
-          <>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 8 }}>
-              <Ruler className="w-4 h-4" style={{ color: "#9097A1" }} />
-              <span className="f-body" style={{ fontSize: 13, color: "#6B7280" }}>Waist</span>
-              <span className="f-disp tnum" style={{ fontSize: 22, fontWeight: 700, color: INK }}>{latestM.waist ?? "—"}<span style={{ fontSize: 13, color: "#9097A1", fontWeight: 600 }}>{latestM.waist != null ? " in" : ""}</span></span>
-            </div>
-            {waistSeries.length >= 2 && <MiniLine values={waistSeries} color="#10B981" height={42} />}
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
-              {MEASURE_FIELDS.filter((f) => f.key !== "waist" && latestM[f.key] != null).map((f) => (
-                <span key={f.key} className="f-body tnum" style={{ fontSize: 12.5, background: "#F6F7F9", borderRadius: 10, padding: "6px 10px", color: "#374151" }}>{f.label} {latestM[f.key]}″</span>
-              ))}
-            </div>
-          </>
-        ) : <Empty icon={Ruler} title="No measurements yet" sub="Track your waist and key spots over time." />}
+        <BodyDiagram latestM={latestM} measures={measures} accent={accent} />
+        {waistSeries.length >= 2 && (
+          <div style={{ marginTop: 8 }}>
+            <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginBottom: 2 }}>Waist trend</div>
+            <MiniLine values={waistSeries} color="#10B981" height={42} />
+          </div>
+        )}
+        {!latestM && <div className="f-body" style={{ fontSize: 12.5, color: "#9097A1", textAlign: "center", marginTop: 6 }}>Tap <b>Log</b> to add your first measurements.</div>}
       </Card>
 
       {/* photos */}
-      <SectionTitle right={<Btn kind="soft" color={accentHex(me.accent)} size="sm" onClick={() => fileRef.current?.click()}><Camera className="w-3.5 h-3.5" /> Add</Btn>}>Progress photos</SectionTitle>
+      <SectionTitle>Progress photos</SectionTitle>
       <input ref={fileRef} type="file" accept="image/*" onChange={onFile} style={{ display: "none" }} />
       <Card>
-        <div className="f-body" style={{ fontSize: 12, color: "#9097A1", marginBottom: photoIdx.length ? 12 : 0 }}>Private to you — your partner can't see these.</div>
-        {photoIdx.length === 0 ? <Empty icon={Camera} title="No photos yet" sub="Add a starting photo to track visible change." /> : (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8 }}>
-            {photoIdx.slice().reverse().map((ph) => (
-              <button key={ph.id} onClick={() => setViewer(ph)} style={{ position: "relative", aspectRatio: "3/4", borderRadius: 12, overflow: "hidden", border: "1px solid #EBEEF2", cursor: "pointer", padding: 0, background: "#F6F7F9" }}>
-                {images[ph.id] ? <img src={images[ph.id]} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}><Camera className="w-5 h-5" style={{ color: "#C7CDD6" }} /></div>}
-                <span className="f-body" style={{ position: "absolute", left: 6, bottom: 6, fontSize: 10, fontWeight: 600, color: "#fff", background: "rgba(0,0,0,.5)", padding: "2px 6px", borderRadius: 6 }}>{fmtDate(ph.date)}</span>
-              </button>
-            ))}
-          </div>
-        )}
+        <div className="f-body" style={{ fontSize: 12, color: "#9097A1", marginBottom: 12 }}>Private to you — grouped by angle so you can compare over time.</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          {POSES.map((p) => (
+            <Btn key={p.key} kind="outline" size="sm" onClick={() => pickPhoto(p.key)}><Camera className="w-3.5 h-3.5" /> {p.label}</Btn>
+          ))}
+        </div>
+        {photoIdx.length === 0
+          ? <div style={{ marginTop: 10 }}><Empty icon={Camera} title="No photos yet" sub="Add a front / side / back shot to start." /></div>
+          : POSES.map((pose) => {
+              const shots = photoIdx.filter((ph) => (ph.pose || "front") === pose.key).sort((a, b) => a.ts - b.ts);
+              if (!shots.length) return null;
+              return (
+                <div key={pose.key} style={{ marginTop: 14 }}>
+                  <div className="f-body" style={{ fontSize: 11, fontWeight: 700, color: "#9097A1", letterSpacing: 0.4, textTransform: "uppercase", marginBottom: 7 }}>{pose.label} · {shots.length}</div>
+                  <div style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4 }}>
+                    {shots.map((ph) => (
+                      <button key={ph.id} onClick={() => setViewer(ph)} style={{ position: "relative", flex: "0 0 auto", width: 94, aspectRatio: "3/4", borderRadius: 12, overflow: "hidden", border: "1px solid #EBEEF2", cursor: "pointer", padding: 0, background: "#F6F7F9" }}>
+                        {images[ph.id] ? <img src={images[ph.id]} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center" }}><Camera className="w-5 h-5" style={{ color: "#C7CDD6" }} /></div>}
+                        <span className="f-body" style={{ position: "absolute", left: 6, bottom: 6, fontSize: 10, fontWeight: 600, color: "#fff", background: "rgba(0,0,0,.5)", padding: "2px 6px", borderRadius: 6 }}>{fmtDate(ph.date)}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
       </Card>
       {busy && <div className="f-body" style={{ textAlign: "center", fontSize: 12.5, color: "#9097A1", marginTop: -6 }}>Working…</div>}
 
       {viewer && (
         <div onClick={() => setViewer(null)} style={{ position: "fixed", inset: 0, background: "rgba(8,10,14,.85)", zIndex: 50, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 20 }}>
           {images[viewer.id] && <img src={images[viewer.id]} alt="" style={{ maxWidth: "100%", maxHeight: "78%", borderRadius: 14 }} />}
-          <div className="f-body" style={{ color: "#fff", marginTop: 12, fontSize: 13 }}>{fmtDate(viewer.date)}</div>
+          <div className="f-body" style={{ color: "#fff", marginTop: 12, fontSize: 13 }}>{POSES.find((p) => p.key === (viewer.pose || "front"))?.label} · {fmtDate(viewer.date)}</div>
           <div style={{ display: "flex", gap: 10, marginTop: 14 }} onClick={(e) => e.stopPropagation()}>
             <Btn kind="outline" onClick={() => { onDeletePhoto(viewer.id); setViewer(null); }}><Trash2 className="w-4 h-4" /> Delete</Btn>
             <Btn color="#fff" style={{ color: INK }} onClick={() => setViewer(null)}>Close</Btn>
@@ -1756,13 +1857,13 @@ export default function App() {
     const measures = (await getJSON(`measure:${mid}`, true)) || [];
     const photoIdx = (await getJSON(`photoidx:${mid}`)) || [];
     const images = {};
-    for (const ph of photoIdx.slice(-12)) images[ph.id] = await store.get(`photo:${mid}:${ph.id}`);
+    for (const ph of photoIdx.slice(-30)) images[ph.id] = await store.get(`photo:${mid}:${ph.id}`);
     const history = [];
     for (let i = 0; i < 14; i++) {
       const d = new Date(); d.setDate(d.getDate() - i); const dk = todayKey(d);
       history.push({ date: dk, log: await getJSON(`log:${mid}:${dk}`, true), plan: await getJSON(`plan:${mid}:${dk}`, true) });
     }
-    const stats = computeStats(history, weights);
+    const stats = computeStats(history, weights, measures, photoIdx);
     await store.set(`stats:${mid}`, stats, true);
     setMyStats(stats);
     setProgress({ weights, measures, photoIdx, images, history, stats });
@@ -1875,14 +1976,14 @@ export default function App() {
     await store.set(`measure:${meId}`, arr, true);
     await loadProgress(meId);
   }
-  async function addPhoto(file) {
+  async function addPhoto(file, pose = "front") {
     setProgressBusy(true);
     try {
       const { dataUrl, w, h } = await fileToThumb(file);
       const id = uid();
       await store.set(`photo:${meId}:${id}`, dataUrl);
       const idx = (await getJSON(`photoidx:${meId}`)) || [];
-      idx.push({ id, ts: Date.now(), date, w, h });
+      idx.push({ id, ts: Date.now(), date, w, h, pose });
       await store.set(`photoidx:${meId}`, idx);
       await loadProgress(meId);
     } catch (e) { setProgressBusy(false); }
@@ -1924,7 +2025,11 @@ export default function App() {
             const active = tab === tb.id, col = active ? accentHex(me.accent) : "#A6ACB5";
             return (
               <button key={tb.id} onClick={() => setTab(tb.id)} style={{ flex: 1, background: "none", border: "none", cursor: "pointer", padding: "10px 0 12px", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
-                <tb.icon className="w-5 h-5" style={{ color: col }} strokeWidth={active ? 2.5 : 2} />
+                <div style={{ position: "relative" }}>
+                  <tb.icon className="w-5 h-5" style={{ color: col }} strokeWidth={active ? 2.5 : 2} />
+                  {tb.id === "progress" && myStats && (isDue(myStats.lastWeighTs) || isDue(myStats.lastMeasureTs) || isDue(myStats.lastPhotoTs)) &&
+                    <span style={{ position: "absolute", top: -2, right: -5, width: 7, height: 7, borderRadius: 4, background: "#F43F5E", border: "1.5px solid #fff" }} />}
+                </div>
                 <span className="f-body" style={{ fontSize: 10, color: col, fontWeight: active ? 600 : 500 }}>{tb.label}</span>
               </button>
             );
