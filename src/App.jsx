@@ -63,6 +63,18 @@ const MEASURE_FIELDS = [
   { key: "waist", label: "Waist" }, { key: "chest", label: "Chest" },
   { key: "hips", label: "Hips" }, { key: "arms", label: "Arm" }, { key: "thighs", label: "Thigh" },
 ];
+const MEALS = [
+  { key: "breakfast", label: "Breakfast" },
+  { key: "lunch", label: "Lunch" },
+  { key: "dinner", label: "Dinner" },
+  { key: "snacks", label: "Snacks" },
+];
+const CUSTOM_TYPES = [
+  { key: "strength", label: "Strength" }, { key: "cardio", label: "Cardio" },
+  { key: "run", label: "Run" }, { key: "bike", label: "Bike" },
+  { key: "mobility", label: "Yoga / mobility" }, { key: "other", label: "Other" },
+];
+const mealForNow = () => { const h = new Date().getHours(); return h < 11 ? "breakfast" : h < 16 ? "lunch" : h < 21 ? "dinner" : "snacks"; };
 
 /* ---------- workout content (rotating split + together pool) ---------- */
 const FOCUS = {
@@ -292,6 +304,21 @@ async function estimateMacros(desc) {
   const j = parseLoose(out);
   if (!j) throw new Error("bad");
   return { label: String(j.label || desc).slice(0, 40), cal: Math.max(0, Math.round(j.calories || 0)),
+    p: Math.max(0, Math.round(j.protein_g || 0)), c: Math.max(0, Math.round(j.carbs_g || 0)), f: Math.max(0, Math.round(j.fat_g || 0)) };
+}
+async function estimateMacrosFromImage(dataUrl) {
+  const m = dataUrl.match(/^data:(image\/[\w.+-]+);base64,(.+)$/);
+  if (!m) throw new Error("bad image");
+  const out = await callClaude(
+    [{ role: "user", content: [
+      { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } },
+      { type: "text", text: "Estimate the nutrition of the food in this photo." },
+    ] }],
+    'You estimate nutrition from a food photo. Reply with ONLY a JSON object, no prose, no markdown: {"label":string,"calories":int,"protein_g":int,"carbs_g":int,"fat_g":int}. Identify the dish and estimate a realistic single serving as shown.',
+    400);
+  const j = parseLoose(out);
+  if (!j) throw new Error("bad");
+  return { label: String(j.label || "Food").slice(0, 40), cal: Math.max(0, Math.round(j.calories || 0)),
     p: Math.max(0, Math.round(j.protein_g || 0)), c: Math.max(0, Math.round(j.carbs_g || 0)), f: Math.max(0, Math.round(j.fat_g || 0)) };
 }
 /* ---------- profile helpers + migration ---------- */
@@ -897,23 +924,37 @@ function Legend({ p, score, you }) {
    ============================================================ */
 function Food({ me, log, onSave }) {
   const t = me.targets, tot = totals(log);
+  const accent = accentHex(me.accent);
+  const [mode, setMode] = useState(null);   // "describe" | "manual" | null
   const [desc, setDesc] = useState("");
-  const [draft, setDraft] = useState(null);
+  const [draft, setDraft] = useState(null);  // { label, cal, p, c, f, meal }
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const fileRef = useRef(null);
   const food = log?.food || [], alcohol = log?.alcohol || [];
+  const aiOn = !!AI_PROXY;
 
+  const openDraft = (d) => { setErr(""); setDraft({ label: "", cal: "", p: "", c: "", f: "", meal: mealForNow(), ...d }); };
   async function estimate() {
     if (!desc.trim()) return;
     setBusy(true); setErr("");
-    try { setDraft(await estimateMacros(desc.trim())); }
-    catch (e) { setErr("Couldn't estimate that one — add the numbers yourself below."); setDraft({ label: desc.trim().slice(0, 40), cal: "", p: "", c: "", f: "" }); }
+    try { const r = await estimateMacros(desc.trim()); openDraft(r); setDesc(""); }
+    catch (e) { setErr("Couldn't estimate that — type the numbers in below."); openDraft({ label: desc.trim().slice(0, 40) }); setDesc(""); }
+    setBusy(false);
+  }
+  async function onPhoto(e) {
+    const f = e.target.files?.[0]; e.target.value = "";
+    if (!f) return;
+    if (!aiOn) { setErr("Photo needs AI turned on. Use Manual to type the numbers."); return; }
+    setMode(null); setBusy(true); setErr("");
+    try { const { dataUrl } = await fileToThumb(f, 800); const r = await estimateMacrosFromImage(dataUrl); openDraft(r); }
+    catch (e2) { setErr("Couldn't read that photo — type the numbers in below."); openDraft({}); }
     setBusy(false);
   }
   function addDraft() {
     if (!draft) return;
-    const entry = { id: uid(), label: draft.label || "Food", cal: +draft.cal || 0, p: +draft.p || 0, c: +draft.c || 0, f: +draft.f || 0, ts: Date.now() };
-    onSave({ ...(log || {}), food: [...food, entry] }); setDraft(null); setDesc(""); setErr("");
+    const entry = { id: uid(), label: draft.label || "Food", cal: +draft.cal || 0, p: +draft.p || 0, c: +draft.c || 0, f: +draft.f || 0, meal: draft.meal || "snacks", ts: Date.now() };
+    onSave({ ...(log || {}), food: [...food, entry] }); setDraft(null); setDesc(""); setErr(""); setMode(null);
   }
   const removeFood = (id) => onSave({ ...(log || {}), food: food.filter((x) => x.id !== id) });
   const addWater = (oz) => onSave({ ...(log || {}), water_oz: Math.max(0, (log?.water_oz || 0) + oz) });
@@ -939,15 +980,28 @@ function Food({ me, log, onSave }) {
 
       <SectionTitle>Add food</SectionTitle>
       <Card>
-        <div style={{ display: "flex", gap: 8 }}>
-          <TextInput value={desc} placeholder="e.g. grilled chicken bowl with rice" onChange={(e) => setDesc(e.target.value)} onKeyDown={(e) => e.key === "Enter" && estimate()} />
-          <Btn color={VIOLET} disabled={busy || !desc.trim()} onClick={estimate}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Wand2 className="w-4 h-4" />}</Btn>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          <Btn kind={mode === "describe" ? "solid" : "outline"} size="sm" color={VIOLET} onClick={() => { setDraft(null); setErr(""); setMode(mode === "describe" ? null : "describe"); }}><Wand2 className="w-4 h-4" /> Describe</Btn>
+          <Btn kind="outline" size="sm" disabled={busy} onClick={() => fileRef.current?.click()}><Camera className="w-4 h-4" /> Photo</Btn>
+          <Btn kind={mode === "manual" ? "solid" : "outline"} size="sm" color={accent} onClick={() => { setMode("manual"); openDraft({}); }}><Edit3 className="w-4 h-4" /> Manual</Btn>
         </div>
-        <div className="f-body" style={{ fontSize: 12, color: "#9097A1", marginTop: 8 }}>Describe it and tap the wand — Tandem estimates the macros for you.</div>
-        {err && <div className="f-body" style={{ fontSize: 12.5, color: "#C2410C", marginTop: 8 }}>{err}</div>}
+        <input ref={fileRef} type="file" accept="image/*" onChange={onPhoto} style={{ display: "none" }} />
+
+        {mode === "describe" && (
+          <>
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <TextInput value={desc} placeholder="e.g. grilled chicken bowl with rice" onChange={(e) => setDesc(e.target.value)} onKeyDown={(e) => e.key === "Enter" && estimate()} />
+              <Btn color={VIOLET} disabled={busy || !desc.trim()} onClick={estimate}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Wand2 className="w-4 h-4" />}</Btn>
+            </div>
+            <div className="f-body" style={{ fontSize: 12, color: "#9097A1", marginTop: 8 }}>Describe it or snap a photo and Tandem estimates the macros. Use Manual to type them off a label.</div>
+          </>
+        )}
+        {busy && !draft && <div className="f-body" style={{ fontSize: 12.5, color: "#9097A1", marginTop: 10, display: "flex", alignItems: "center", gap: 7 }}><RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> Reading…</div>}
+        {err && <div className="f-body" style={{ fontSize: 12.5, color: "#C2410C", marginTop: 10 }}>{err}</div>}
+
         {draft && (
           <div style={{ marginTop: 14, padding: 14, background: "#F6F7F9", borderRadius: 14 }}>
-            <TextInput value={draft.label} onChange={(e) => setDraft({ ...draft, label: e.target.value })} style={{ ...inputStyle, marginBottom: 10, fontWeight: 600 }} />
+            <TextInput value={draft.label} placeholder="Food name" onChange={(e) => setDraft({ ...draft, label: e.target.value })} style={{ ...inputStyle, marginBottom: 10, fontWeight: 600 }} />
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
               {[["cal", "kcal"], ["p", "protein"], ["c", "carbs"], ["f", "fat"]].map(([k, lbl]) => (
                 <div key={k}>
@@ -956,9 +1010,18 @@ function Food({ me, log, onSave }) {
                 </div>
               ))}
             </div>
+            <div style={{ marginTop: 12 }}>
+              <div className="f-body" style={{ fontSize: 11, color: "#9097A1", marginBottom: 6 }}>Meal</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 6 }}>
+                {MEALS.map((m) => (
+                  <button key={m.key} onClick={() => setDraft({ ...draft, meal: m.key })} className="f-body" style={{ fontSize: 12, padding: "7px 4px", borderRadius: 9, cursor: "pointer", fontWeight: 600,
+                    border: "1px solid " + (draft.meal === m.key ? accent : "#E5E8EC"), background: draft.meal === m.key ? accent + "14" : "#fff", color: draft.meal === m.key ? accent : "#6B7280" }}>{m.label}</button>
+                ))}
+              </div>
+            </div>
             <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-              <Btn kind="outline" size="sm" onClick={() => setDraft(null)}>Cancel</Btn>
-              <Btn full size="sm" color={accentHex(me.accent)} onClick={addDraft}><Plus className="w-4 h-4" /> Add to log</Btn>
+              <Btn kind="outline" size="sm" onClick={() => { setDraft(null); setMode(null); }}>Cancel</Btn>
+              <Btn full size="sm" color={accent} onClick={addDraft}><Plus className="w-4 h-4" /> Add to log</Btn>
             </div>
           </div>
         )}
@@ -968,15 +1031,28 @@ function Food({ me, log, onSave }) {
       {food.length === 0
         ? <Card><Empty icon={Utensils} title="Nothing logged yet" sub="Add your first meal above." /></Card>
         : <Card style={{ padding: 8 }}>
-            {food.map((x) => (
-              <div key={x.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px", borderBottom: "1px solid #F1F3F6" }}>
-                <div style={{ flex: 1 }}>
-                  <div className="f-body" style={{ fontSize: 14, fontWeight: 600, color: INK }}>{x.label}</div>
-                  <div className="f-body tnum" style={{ fontSize: 12, color: "#9097A1" }}>{x.cal} kcal · {x.p}p · {x.c}c · {x.f}f</div>
+            {MEALS.map((m) => {
+              const rows = food.filter((x) => (x.meal || "snacks") === m.key);
+              if (!rows.length) return null;
+              const mcal = rows.reduce((s, x) => s + (x.cal || 0), 0);
+              return (
+                <div key={m.key}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "10px 10px 4px" }}>
+                    <span className="f-body" style={{ fontSize: 11, fontWeight: 700, color: "#9097A1", letterSpacing: 0.4, textTransform: "uppercase" }}>{m.label}</span>
+                    <span className="f-disp tnum" style={{ fontSize: 11.5, color: "#B6BCC4" }}>{mcal} kcal</span>
+                  </div>
+                  {rows.map((x) => (
+                    <div key={x.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px", borderBottom: "1px solid #F1F3F6" }}>
+                      <div style={{ flex: 1 }}>
+                        <div className="f-body" style={{ fontSize: 14, fontWeight: 600, color: INK }}>{x.label}</div>
+                        <div className="f-body tnum" style={{ fontSize: 12, color: "#9097A1" }}>{x.cal} kcal · {x.p}p · {x.c}c · {x.f}f</div>
+                      </div>
+                      <button onClick={() => removeFood(x.id)} style={{ background: "none", border: "none", cursor: "pointer", padding: 6 }}><Trash2 className="w-4 h-4" style={{ color: "#C7CDD6" }} /></button>
+                    </div>
+                  ))}
                 </div>
-                <button onClick={() => removeFood(x.id)} style={{ background: "none", border: "none", cursor: "pointer", padding: 6 }}><Trash2 className="w-4 h-4" style={{ color: "#C7CDD6" }} /></button>
-              </div>
-            ))}
+              );
+            })}
           </Card>}
 
       {/* alcohol */}
@@ -1017,10 +1093,14 @@ function Food({ me, log, onSave }) {
 /* ============================================================
    TRAIN
    ============================================================ */
-const TYPE_ICON = { strength: Dumbbell, cardio: Activity, run: Footprints, mobility: Bike };
-function SlotRow({ slot, accent, onToggle, onSub, onRemove, compact }) {
+const TYPE_ICON = { strength: Dumbbell, cardio: Activity, run: Footprints, mobility: Bike, bike: Bike, other: Activity };
+function SlotRow({ slot, accent, onToggle, onSub, onRemove, onEdit, compact }) {
   const [open, setOpen] = useState(false);
   const Icon = TYPE_ICON[slot.type] || Dumbbell;
+  const metrics = [];
+  if (slot.distance) metrics.push(`${slot.distance} mi`);
+  if (slot.calories) metrics.push(`${slot.calories} cal`);
+  const hasDetail = (slot.exercises || []).length > 0 || slot.notes;
   return (
     <Card style={{ padding: 0, overflow: "hidden", borderColor: slot.done ? accent + "55" : "#EBEEF2" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: 14 }}>
@@ -1036,10 +1116,13 @@ function SlotRow({ slot, accent, onToggle, onSub, onRemove, compact }) {
           <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
             <span className="f-body" style={{ fontSize: 14.5, fontWeight: 600, color: INK, textDecoration: slot.done ? "line-through" : "none", opacity: slot.done ? 0.55 : 1 }}>{slot.title}</span>
             {slot.together && <span className="f-body" style={{ fontSize: 10, fontWeight: 700, color: "#fff", background: VIOLET, padding: "2px 6px", borderRadius: 6 }}>TOGETHER</span>}
+            {slot.custom && <span className="f-body" style={{ fontSize: 10, fontWeight: 700, color: "#fff", background: "#10B981", padding: "2px 6px", borderRadius: 6 }}>LOGGED</span>}
           </div>
-          <div className="f-body" style={{ fontSize: 12, color: "#9097A1", display: "flex", gap: 8, marginTop: 2 }}>
+          <div className="f-body" style={{ fontSize: 12, color: "#9097A1", display: "flex", gap: 8, marginTop: 2, flexWrap: "wrap" }}>
             <span><Clock className="w-3 h-3" style={{ display: "inline", marginRight: 3, verticalAlign: "-1px" }} />{slot.time}</span>
-            <span>· {slot.duration} min</span>{slot.location && <span>· {slot.location}</span>}
+            {slot.duration ? <span>· {slot.duration} min</span> : null}
+            {slot.location && <span>· {slot.location}</span>}
+            {metrics.map((m, i) => <span key={i}>· {m}</span>)}
           </div>
         </div>
         {!compact && <button onClick={() => setOpen(!open)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}>
@@ -1047,17 +1130,21 @@ function SlotRow({ slot, accent, onToggle, onSub, onRemove, compact }) {
       </div>
       {open && !compact && (
         <div style={{ padding: "0 14px 14px" }}>
-          <div style={{ background: "#F6F7F9", borderRadius: 12, padding: 12 }}>
-            {(slot.exercises || []).map((e, i) => (
-              <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: i < slot.exercises.length - 1 ? "1px solid #ECEFF2" : "none" }}>
-                <span className="f-body" style={{ fontSize: 13.5, color: INK }}>{e.name}</span>
-                <span className="f-body tnum" style={{ fontSize: 13, color: "#7A828D" }}>{e.detail}</span>
-              </div>
-            ))}
-          </div>
-          {(onSub || onRemove) && (
-            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-              {onSub && <Btn kind="outline" size="sm" onClick={() => onSub(slot.id)}><RefreshCw className="w-3.5 h-3.5" /> Swap</Btn>}
+          {(slot.exercises || []).length > 0 && (
+            <div style={{ background: "#F6F7F9", borderRadius: 12, padding: 12 }}>
+              {slot.exercises.map((e, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: i < slot.exercises.length - 1 ? "1px solid #ECEFF2" : "none" }}>
+                  <span className="f-body" style={{ fontSize: 13.5, color: INK }}>{e.name}</span>
+                  <span className="f-body tnum" style={{ fontSize: 13, color: "#7A828D" }}>{e.detail}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {slot.notes && <div className="f-body" style={{ fontSize: 13, color: "#6B7280", marginTop: hasDetail ? 10 : 0, background: "#F6F7F9", borderRadius: 10, padding: "10px 12px", lineHeight: 1.5 }}>{slot.notes}</div>}
+          {(onSub || onRemove || onEdit) && (
+            <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+              {onEdit && <Btn kind="outline" size="sm" onClick={() => onEdit(slot.id)}><Edit3 className="w-3.5 h-3.5" /> Edit</Btn>}
+              {onSub && !slot.custom && <Btn kind="outline" size="sm" onClick={() => onSub(slot.id)}><RefreshCw className="w-3.5 h-3.5" /> Swap</Btn>}
               {onRemove && <Btn kind="outline" size="sm" onClick={() => onRemove(slot.id)}><Trash2 className="w-3.5 h-3.5" /> Remove</Btn>}
             </div>
           )}
@@ -1095,7 +1182,7 @@ function WeekDay({ dk, plan, isToday, accent, me, prefs, busy, on }) {
         <div style={{ padding: "0 12px 12px" }}>
           {slots.map((sl) => (
             <div key={sl.id}>
-              <SlotRow slot={sl} accent={accent} onToggle={(id) => on.toggle(dk, id)} onSub={(id) => on.swap(dk, id)} onRemove={(id) => on.remove(dk, id)} />
+              <SlotRow slot={sl} accent={accent} onToggle={(id) => on.toggle(dk, id)} onSub={(id) => on.swap(dk, id)} onRemove={(id) => on.remove(dk, id)} onEdit={(id) => on.edit(dk, id)} />
               <div style={{ display: "flex", gap: 6, margin: "-6px 0 12px 4px", flexWrap: "wrap" }}>
                 {TIMES.map((tm) => (
                   <button key={tm} onClick={() => on.reschedule(dk, sl.id, tm)} className="f-body" style={{ fontSize: 11.5, padding: "4px 9px", borderRadius: 8, cursor: "pointer",
@@ -1104,8 +1191,9 @@ function WeekDay({ dk, plan, isToday, accent, me, prefs, busy, on }) {
               </div>
             </div>
           ))}
-          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-            <Btn kind="outline" size="sm" disabled={busy} onClick={() => on.addSession(dk)}><Plus className="w-3.5 h-3.5" /> Add session</Btn>
+          <div style={{ display: "flex", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
+            <Btn kind="soft" color={accent} size="sm" onClick={() => on.addCustom(dk)}><Plus className="w-3.5 h-3.5" /> Add what I did</Btn>
+            <Btn kind="outline" size="sm" disabled={busy} onClick={() => on.addSession(dk)}><Plus className="w-3.5 h-3.5" /> Plan a session</Btn>
             {slots.length > 0 && <Btn kind="outline" size="sm" disabled={busy} onClick={() => on.restDay(dk)}>Rest day</Btn>}
           </div>
         </div>
@@ -1113,8 +1201,77 @@ function WeekDay({ dk, plan, isToday, accent, me, prefs, busy, on }) {
     </Card>
   );
 }
+function SessionEditor({ me, slot, onSave, onClose }) {
+  const isEdit = !!slot;
+  const accent = accentHex(me.accent);
+  const [s, setS] = useState(() => ({
+    id: slot?.id, title: slot?.title || "", type: slot?.type || "strength",
+    time: slot?.time || (slot ? slot.time : "Evening"), duration: slot?.duration ?? 30,
+    distance: slot?.distance ?? "", calories: slot?.calories ?? "", notes: slot?.notes || "",
+    exercises: slot?.exercises ? slot.exercises.map((e) => ({ ...e })) : [],
+  }));
+  const set = (k, v) => setS((q) => ({ ...q, [k]: v }));
+  const addEx = () => setS((q) => ({ ...q, exercises: [...q.exercises, { name: "", detail: "" }] }));
+  const setEx = (i, k, v) => setS((q) => ({ ...q, exercises: q.exercises.map((e, j) => (j === i ? { ...e, [k]: v } : e)) }));
+  const delEx = (i) => setS((q) => ({ ...q, exercises: q.exercises.filter((_, j) => j !== i) }));
+  function save() {
+    const data = {
+      title: s.title.trim() || "Workout", type: s.type, time: s.time,
+      duration: Math.max(0, Math.round(+s.duration || 0)),
+      exercises: s.exercises.filter((e) => e.name.trim()).map((e) => ({ name: e.name.trim(), detail: (e.detail || "").trim() })),
+    };
+    if (+s.distance) data.distance = +s.distance;
+    if (+s.calories) data.calories = Math.round(+s.calories);
+    if (s.notes.trim()) data.notes = s.notes.trim();
+    if (s.id) data.id = s.id;
+    onSave(data);
+  }
+  const numStyle = { ...inputStyle, padding: "10px 11px", textAlign: "center" };
+  return (
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(8,10,14,.5)", zIndex: 60, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+      <div onClick={(e) => e.stopPropagation()} className="f-body" style={{ background: "#fff", width: "100%", maxWidth: 480, borderRadius: "22px 22px 0 0", padding: 20, maxHeight: "88vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", alignItems: "center", marginBottom: 16 }}>
+          <h2 className="f-disp" style={{ fontSize: 19, fontWeight: 700, color: INK, margin: 0 }}>{isEdit ? "Edit session" : "Add what I did"}</h2>
+          <button onClick={onClose} style={{ marginLeft: "auto", background: "none", border: "none", cursor: "pointer" }}><X className="w-5 h-5" style={{ color: "#9097A1" }} /></button>
+        </div>
+        <Field label="What was it?"><TextInput value={s.title} placeholder="e.g. Custom chest day · Garmin run" onChange={(e) => set("title", e.target.value)} /></Field>
+        <Field label="Type">
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+            {CUSTOM_TYPES.map((ct) => (
+              <button key={ct.key} onClick={() => set("type", ct.key)} className="f-body" style={{ fontSize: 13, padding: "7px 11px", borderRadius: 10, cursor: "pointer", fontWeight: 600,
+                border: "1px solid " + (s.type === ct.key ? accent : "#E5E8EC"), background: s.type === ct.key ? accent + "14" : "#fff", color: s.type === ct.key ? accent : "#6B7280" }}>{ct.label}</button>
+            ))}
+          </div>
+        </Field>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+          <Field label="Minutes"><input className="f-body tnum" type="number" inputMode="numeric" value={s.duration} onChange={(e) => set("duration", e.target.value)} style={numStyle} /></Field>
+          <Field label="Miles"><input className="f-body tnum" type="number" inputMode="decimal" value={s.distance} placeholder="—" onChange={(e) => set("distance", e.target.value)} style={numStyle} /></Field>
+          <Field label="Calories"><input className="f-body tnum" type="number" inputMode="numeric" value={s.calories} placeholder="—" onChange={(e) => set("calories", e.target.value)} style={numStyle} /></Field>
+        </div>
+        <Field label="When"><Choice columns={4} value={s.time} onChange={(v) => set("time", v)} options={TIMES.map((tm) => ({ value: tm, label: tm }))} /></Field>
+        <Field label="Notes (optional)"><textarea className="f-body" value={s.notes} placeholder="How it went, anything to remember…" onChange={(e) => set("notes", e.target.value)} style={{ ...inputStyle, minHeight: 60, resize: "vertical", lineHeight: 1.5 }} /></Field>
+        <div style={{ marginBottom: 16 }}>
+          <div className="f-body" style={{ fontSize: 13, fontWeight: 600, color: "#374151", marginBottom: 7 }}>Exercises (optional)</div>
+          {s.exercises.map((e, i) => (
+            <div key={i} style={{ display: "flex", gap: 7, marginBottom: 7 }}>
+              <input className="f-body" value={e.name} placeholder="Exercise" onChange={(ev) => setEx(i, "name", ev.target.value)} style={{ ...inputStyle, flex: 2 }} />
+              <input className="f-body" value={e.detail} placeholder="3×10" onChange={(ev) => setEx(i, "detail", ev.target.value)} style={{ ...inputStyle, flex: 1 }} />
+              <button onClick={() => delEx(i)} style={{ background: "#F1F3F6", border: "none", borderRadius: 10, padding: "0 11px", cursor: "pointer", flexShrink: 0 }}><X className="w-4 h-4" style={{ color: "#9097A1" }} /></button>
+            </div>
+          ))}
+          <Btn kind="outline" size="sm" onClick={addEx}><Plus className="w-3.5 h-3.5" /> Add exercise</Btn>
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <Btn kind="outline" onClick={onClose}>Cancel</Btn>
+          <Btn full color={accent} onClick={save}><Check className="w-4 h-4" /> {isEdit ? "Save" : "Log it"}</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
 function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref }) {
   const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(null); // { dk, slot } — slot null = add custom
   const accent = accentHex(me.accent);
   const aiOn = !!AI_PROXY;
   const today = todayKey();
@@ -1143,6 +1300,8 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref }) {
       onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? { ...s, time } : s)) });
     },
     restDay(dk) { onSaveDay(dk, { slots: [] }); },
+    edit(dk, id) { const plan = plans[dk] || { slots: [] }; const slot = plan.slots.find((s) => s.id === id); if (slot) setEditing({ dk, slot }); },
+    addCustom(dk) { setEditing({ dk, slot: null }); },
     async swap(dk, id) {
       const plan = plans[dk] || { slots: [] };
       const cur = plan.slots.find((s) => s.id === id); if (!cur) return;
@@ -1176,6 +1335,17 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref }) {
     },
   };
   async function gen(useAI) { setBusy(true); await onGenWeek(useAI); setBusy(false); }
+  function saveSession(dk, data) {
+    const plan = plans[dk] || { slots: [] };
+    let slots;
+    if (data.id && plan.slots.some((s) => s.id === data.id)) {
+      slots = plan.slots.map((s) => (s.id === data.id ? { ...s, ...data } : s));
+    } else {
+      slots = [...plan.slots, { ...data, id: uid(), done: true, custom: true }];
+    }
+    onSaveDay(dk, { slots });
+    setEditing(null);
+  }
 
   let wkDone = 0, wkTotal = 0;
   dates.forEach((d) => { const s = plans[d]?.slots || []; wkDone += s.filter((x) => x.done).length; wkTotal += s.length; });
@@ -1207,6 +1377,7 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref }) {
       {dates.map((dk) => (
         <WeekDay key={dk} dk={dk} plan={plans[dk]} isToday={dk === today} accent={accent} me={me} prefs={prefs} busy={busy} on={on} />
       ))}
+      {editing && <SessionEditor me={me} slot={editing.slot} onSave={(data) => saveSession(editing.dk, data)} onClose={() => setEditing(null)} />}
       <div style={{ height: 8 }} />
     </Screen>
   );
