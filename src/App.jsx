@@ -351,6 +351,7 @@ function migrate(p) {
   if (!q.sessionsPerDay) q.sessionsPerDay = 1;
   if (!q.secondTime) q.secondTime = "Evening";
   if (!q.pace) q.pace = "standard";
+  if (typeof q.trainingStyle !== "string") q.trainingStyle = "";
   return q;
 }
 const accessesOf = (p) => (p?.accesses?.length ? p.accesses : p?.access ? [p.access] : ["home"]);
@@ -386,24 +387,45 @@ function sessionAccess(accesses, i) {
   if (i === 0) return order[0];
   return order.length > 1 ? order[order.length - 1] : order[0];
 }
-async function aiFocusWorkout(p, access, focus) {
+const COACH_STYLE = `Program like an experienced strength coach:
+- Build each session as a warm-up ramp, then working sets. For main lifts, ramp up (a light set ~RPE 1-2, then a few reps around 50-75% of the working weight) before the working sets.
+- Prescribe working sets as SETS × REP-RANGE with an RPE target. RPE is reps-in-reserve on a 1-10 scale (RPE 8 ≈ 2 reps left, RPE 10 = failure). Example detail: "3-4 × 8-12 @ RPE 8, rest 90s".
+- Use "% of 1RM" only for a heavy compound's warm-up ramp, never as the whole prescription — otherwise use RPE.
+- Where it fits, pair movements into supersets, include a unilateral / weak-side-first movement, and a core or anti-rotation piece.
+- Keep any cue brief.`;
+
+async function aiFocusWorkout(p, access, focus, note = "") {
   const goalHint = p.goal === "recomp" ? "lose fat while building muscle" : GOALS[p.goal]?.label;
+  const style = p.trainingStyle ? `\nTrainee's own style notes: ${p.trainingStyle}` : "";
+  const adj = note ? `\nApply this adjustment from the trainee: ${note}` : "";
   const out = await callClaude(
     [{ role: "user", content:
-      `Build a "${focus}" workout for ${ACCESS[access]?.label} access. Goal: ${goalHint}. Pace: ${p.pace}. ~30–45 min, 4–6 exercises, realistic.` }],
-    'You are a fitness coach. Reply with ONLY a JSON object, no prose: {"title":string,"type":"strength"|"cardio"|"mobility"|"run","duration_min":int,"exercises":[{"name":string,"detail":string}]}. "detail" is sets×reps or time. Keep the title close to the requested focus.',
-    700);
+      `Build a "${focus}" workout for ${ACCESS[access]?.label} access. Goal: ${goalHint}. Pace: ${p.pace}. ~30-45 min, 4-6 exercises, realistic.${style}${adj}` }],
+    COACH_STYLE + '\n\nReply with ONLY a JSON object, no prose: {"title":string,"type":"strength"|"cardio"|"mobility"|"run","duration_min":int,"exercises":[{"name":string,"detail":string}]}. "detail" must clearly state sets × rep-range @ RPE (and rest), e.g. "3 × 8-12 @ RPE 8, rest 90s". Keep the title close to the requested focus.',
+    800);
   const j = parseLoose(out);
   if (!j || !Array.isArray(j.exercises)) throw new Error("bad");
   return { title: j.title || focus, focus, access, type: j.type || "strength",
-    duration: j.duration_min || 40, location: ACCESS[access]?.label || "", exercises: j.exercises.slice(0, 8) };
+    duration: j.duration_min || 40, location: ACCESS[access]?.label || "", exercises: j.exercises.slice(0, 10) };
 }
-async function aiOrTemplate(p, access, focus, cache) {
-  const k = access + "|" + focus;
+async function aiOrTemplate(p, access, focus, cache, note = "") {
+  const k = access + "|" + focus + "|" + note;
   if (cache[k]) return cache[k];
-  try { cache[k] = await aiFocusWorkout(p, access, focus); }
+  try { cache[k] = await aiFocusWorkout(p, access, focus, note); }
   catch (e) { cache[k] = templateSlot(access, focus); }
   return cache[k];
+}
+async function aiAdjustDay(p, slots, request) {
+  const cur = (slots || []).map((s) => `- ${s.title} (${s.type}, ${s.duration}min): ${(s.exercises || []).map((e) => `${e.name} ${e.detail}`).join("; ")}`).join("\n");
+  const style = p.trainingStyle ? `\nTrainee's own style notes: ${p.trainingStyle}` : "";
+  const out = await callClaude(
+    [{ role: "user", content:
+      `Today's planned workout:\n${cur || "(nothing planned)"}\n\nTrainee's request: ${request}\n\nRevise today's workout accordingly. Keep a similar number of sessions unless the request says otherwise.${style}` }],
+    COACH_STYLE + '\n\nReply with ONLY a JSON object, no prose: {"sessions":[{"title":string,"type":"strength"|"cardio"|"mobility"|"run","duration_min":int,"exercises":[{"name":string,"detail":string}]}]}. "detail" must clearly state sets × rep-range @ RPE (and rest).',
+    1200);
+  const j = parseLoose(out);
+  if (!j || !Array.isArray(j.sessions)) throw new Error("bad");
+  return j.sessions;
 }
 function togetherBase(date) {
   const t = TOGETHER_POOL[dayOfYear(date) % TOGETHER_POOL.length];
@@ -431,7 +453,7 @@ function weekDates(startKey) {
 // otherwise existing days are kept (so edits and rest days survive). useAI
 // enriches with Claude, caching one call per unique (access, focus).
 async function buildWeekPlans(p, wkStart, prefs, existing = {}, opts = {}) {
-  const { force = false, useAI = false } = opts;
+  const { force = false, useAI = false, note = "" } = opts;
   const dates = weekDates(wkStart);
   const accesses = accessesOf(p);
   const orderByAccess = {}; accesses.forEach((a) => (orderByAccess[a] = focusOrder(a, prefs)));
@@ -447,7 +469,7 @@ async function buildWeekPlans(p, wkStart, prefs, existing = {}, opts = {}) {
       const order = orderByAccess[access] || ["Full-body strength"];
       let focus = order[(di + i * (order.length > 1 ? 2 : 1)) % order.length];
       if (slots.some((s) => s.focus === focus)) focus = order[(di + i + 3) % order.length];
-      const base = useAI ? await aiOrTemplate(p, access, focus, cache) : templateSlot(access, focus);
+      const base = useAI ? await aiOrTemplate(p, access, focus, cache, note) : templateSlot(access, focus);
       slots.push(placeSlot(base, i === 0 ? (p.mainTime || "Lunch") : (p.secondTime || "Evening")));
     }
     if (togetherOnDate(p, dk)) slots.push({ ...placeSlot(togetherBase(dk), p.together?.time || "Evening"), together: true });
@@ -1304,11 +1326,30 @@ function SessionEditor({ me, slot, onSave, onClose }) {
 function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(null); // { dk, slot } — slot null = add custom
+  const [req, setReq] = useState("");
+  const [showRpe, setShowRpe] = useState(false);
   const accent = accentHex(me.accent);
   const aiOn = !!AI_PROXY;
   const today = todayKey();
   const plans = week?.plans || {};
   const dates = week?.dates || weekDates(weekStartKey());
+
+  async function applyChange(toWeek) {
+    const r = req.trim(); if (!r) return;
+    setBusy(true);
+    try {
+      if (toWeek) {
+        await onGenWeek(true, r);
+      } else {
+        const sessions = await aiAdjustDay(me, plans[today]?.slots || [], r);
+        const times = [me.mainTime || "Lunch", me.secondTime || "Evening"];
+        const slots = sessions.map((s, i) => placeSlot({ title: s.title, focus: "custom", access: accessesOf(me)[0], type: s.type, duration: s.duration_min, location: "", exercises: s.exercises || [] }, times[i] || "Evening"));
+        await onSaveDay(today, { slots });
+      }
+      setReq("");
+    } catch (e) { /* leave text so they can retry */ }
+    setBusy(false);
+  }
 
   async function buildOne(access, focus) {
     if (aiOn) { try { return await aiFocusWorkout(me, access, focus); } catch (e) { return templateSlot(access, focus); } }
@@ -1405,6 +1446,29 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref }) {
         {!aiOn && <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 8 }}>Turn on AI (see setup) and Tandem will write each week's workouts for you — and learn what you keep vs. skip.</div>}
         {aiOn && <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 8 }}>AI learns from what you finish vs. swap away, and leans your week toward what you like.</div>}
       </Card>
+
+      {aiOn && (
+        <Card>
+          <div className="f-body" style={{ fontWeight: 600, color: INK, fontSize: 14, marginBottom: 8, display: "flex", alignItems: "center", gap: 7 }}><Wand2 className="w-4 h-4" style={{ color: VIOLET }} /> Ask the coach to change it</div>
+          <textarea className="f-body" value={req} placeholder="e.g. make today arms & shoulders only · add a Pallof press · swap Wednesday for a run · more RPE-8 supersets this week" onChange={(e) => setReq(e.target.value)} style={{ ...inputStyle, minHeight: 56, resize: "vertical", lineHeight: 1.5 }} />
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <Btn kind="soft" color={accent} size="sm" disabled={busy || !req.trim()} onClick={() => applyChange(false)}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-4 h-4" />} Apply to today</Btn>
+            <Btn kind="soft" color={VIOLET} size="sm" disabled={busy || !req.trim()} onClick={() => applyChange(true)}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-4 h-4" />} Apply to week</Btn>
+          </div>
+        </Card>
+      )}
+
+      <button onClick={() => setShowRpe(!showRpe)} className="f-body" style={{ width: "100%", textAlign: "left", background: "none", border: "none", cursor: "pointer", padding: "0 2px 8px", color: "#9097A1", fontSize: 12.5, display: "flex", alignItems: "center", gap: 6 }}>
+        <ChevronDown className="w-3.5 h-3.5" style={{ transform: showRpe ? "rotate(180deg)" : "none", transition: "transform .2s" }} /> What do RPE and % mean?
+      </button>
+      {showRpe && (
+        <Card style={{ background: "#F6F7F9", border: "none" }}>
+          <div className="f-body" style={{ fontSize: 12.5, color: "#4B5563", lineHeight: 1.6 }}>
+            <b>RPE</b> (Rate of Perceived Exertion, 1–10) = how many reps you had left. <b>RPE 8</b> ≈ 2 reps in reserve, <b>RPE 10</b> = all-out. Prescriptions read like <span className="tnum">3 × 8–12 @ RPE 8</span> — do 3 sets of 8–12 reps, stopping ~2 shy of failure, and pick a weight that makes that true.<br /><br />
+            <b>% (of 1RM)</b> = a load relative to your one-rep max, used mainly to ramp up on heavy compound lifts (e.g. warm-up sets at 50–75% before working sets). RPE autoregulates day to day; % is a fixed target off your max.
+          </div>
+        </Card>
+      )}
 
       {dates.map((dk) => (
         <WeekDay key={dk} dk={dk} plan={plans[dk]} isToday={dk === today} accent={accent} me={me} prefs={prefs} busy={busy} on={on} />
@@ -1943,17 +2007,17 @@ export default function App() {
     setMyWeek((w) => (w ? { ...w, plans: { ...w.plans, [dk]: plan } } : w));
     if (dk === date) setMyPlan(plan);
   }
-  async function regenWeek(prof, useAI) {
+  async function regenWeek(prof, useAI, note = "") {
     const who = prof || me;
     const pf = prefs || (await getJSON(`prefs:${who.id}`, true)) || { like: {}, skip: {} };
     const wk = weekStartKey();
     const dates = weekDates(wk);
-    const built = await buildWeekPlans(who, wk, pf, {}, { force: true, useAI });
+    const built = await buildWeekPlans(who, wk, pf, {}, { force: true, useAI, note });
     for (const dk of dates) await store.set(`plan:${who.id}:${dk}`, built[dk], true);
     setMyWeek({ weekStart: wk, dates, plans: built });
     if (built[todayKey()]) setMyPlan(built[todayKey()]);
   }
-  async function genWeek(useAI) { await regenWeek(me, useAI); }
+  async function genWeek(useAI, note = "") { await regenWeek(me, useAI, note); }
   async function bumpPreference(focus, kind) {
     const pf = bumpPref(prefs, focus, kind);
     setPrefs(pf);
@@ -2069,6 +2133,9 @@ function EditProfile({ me, onDone, onCancel }) {
         </Field>
       )}
       <Field label="Training together"><Choice value={p.together.mode} onChange={(v) => set("together", { ...p.together, mode: v })} options={Object.entries(TOGETHER_MODES).map(([k, v]) => ({ value: k, label: v.label }))} columns={3} /></Field>
+      <Field label="Coaching style notes (optional)" hint="Fed to the AI when it writes your workouts — favorite lifts, splits, injuries to work around, RPE vs %, superset preferences, etc.">
+        <textarea className="f-body" value={p.trainingStyle || ""} placeholder="e.g. Station-based supersets, warm-up ramps, RPE 8–10 working sets, lots of unilateral + core, bad left shoulder — go easy on overhead pressing." onChange={(e) => set("trainingStyle", e.target.value)} style={{ ...inputStyle, minHeight: 72, resize: "vertical", lineHeight: 1.5 }} />
+      </Field>
       {targets.warn && (
         <div className="f-body" style={{ display: "flex", gap: 9, fontSize: 12.5, color: "#92400E", background: "#FEF3C7", borderRadius: 12, padding: "11px 13px", marginBottom: 12, lineHeight: 1.5 }}>
           <AlertTriangle className="w-4 h-4" style={{ flexShrink: 0, marginTop: 1, color: "#B45309" }} /><span>{targets.warn}</span>
