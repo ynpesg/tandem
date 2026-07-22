@@ -258,7 +258,7 @@ function dayScore(profile, log, plan) {
   const parts = [];
   parts.push(pct(log?.water_oz || 0, profile.targets.water_oz));
   parts.push(pct(totals(log).p, profile.targets.protein));
-  const slots = plan?.slots || [];
+  const slots = (plan?.slots || []).filter((x) => !x.skipped);
   if (slots.length) parts.push(slots.filter((x) => x.done).length / slots.length);
   return parts.reduce((a, b) => a + b, 0) / parts.length;
 }
@@ -310,15 +310,121 @@ function bestSet(sets) {
   return best;
 }
 const LOWER_RE = /squat|deadlift|dead lift|leg press|lunge|rdl|romanian|hip thrust|calf|split squat|step-?up|hack/;
-function suggestLoad(history, target, name) {
+const UPPER_RE = /bench|overhead|ohp|shoulder press|chest press|incline press|\brow\b|pull-?up|chin-?up|\bdip\b|push-?up|pulldown|pull-down|pull down/;
+function liftCategory(name) {
+  const s = String(name).toLowerCase();
+  if (LOWER_RE.test(s)) return "lower";
+  if (UPPER_RE.test(s)) return "upper";
+  return "iso";
+}
+const BW_CEIL = { lower: 3.0, upper: 2.0, iso: 1.0 }; // rough elite ceilings × bodyweight
+// Double progression: work up the rep range at a fixed load; only add weight
+// once the hardest working set reaches the top of the range. Increments are
+// plate-rounded, capped at ~10% of the load, and a bodyweight-relative ceiling
+// prevents runaway suggestions once someone is very strong.
+function suggestLoad(history, target, name, bodyLb = 0) {
   if (!history || !history.length) return null;
   const last = history[history.length - 1];
-  const top = last.top || bestSet(last.sets);
+  const sets = (last.sets || []).filter((s) => s.w != null && s.reps != null && s.w > 0);
+  if (!sets.length) return null;
+  const top = last.top || bestSet(sets);
   if (!top || top.w == null) return null;
   const hi = target.hi || 10;
-  const inc = LOWER_RE.test(String(name).toLowerCase()) ? 10 : 5;
-  const next = top.reps >= hi ? top.w + inc : top.w;
-  return { last: top, next, up: next > top.w };
+  const minReps = Math.min(...sets.map((s) => s.reps));
+  const cat = liftCategory(name);
+  const baseInc = cat === "lower" ? 10 : 5;
+  const roundP = (x) => Math.max(2.5, Math.round(x / 2.5) * 2.5);
+  const inc = Math.min(baseInc, roundP(0.10 * top.w));
+  const ceil = bodyLb ? BW_CEIL[cat] * bodyLb : Infinity;
+  let next = top.w, note = "";
+  if (minReps >= hi) {
+    if (top.w + inc <= ceil) { next = top.w + inc; note = `hit top of range → +${inc} lb`; }
+    else { next = top.w; note = "very strong here — add reps or a set"; }
+  } else {
+    note = `stay here, work toward ${hi} reps`;
+  }
+  return { last: top, next, up: next > top.w, note };
+}
+
+/* ---------- strength balance ---------- */
+const MUSCLES = ["Chest", "Back", "Shoulders", "Biceps", "Triceps", "Quads", "Hamstrings", "Glutes", "Calves", "Core"];
+// Rough e1RM ÷ bodyweight ratio considered "strong" for each lift, used to
+// normalize different exercises onto one 0-100 scale. A gauge, not gospel.
+const EX_STD = [
+  { re: /leg press/, g: ["Quads", "Glutes"], s: 2.75 },
+  { re: /hack squat/, g: ["Quads"], s: 2.0 },
+  { re: /leg extension/, g: ["Quads"], s: 1.0 },
+  { re: /lunge|split squat|bulgarian|step-?up/, g: ["Quads", "Glutes"], s: 0.9 },
+  { re: /front squat/, g: ["Quads"], s: 1.4 },
+  { re: /\bsquat\b/, g: ["Quads", "Glutes"], s: 1.75 },
+  { re: /romanian|\brdl\b|good ?morning/, g: ["Hamstrings", "Glutes"], s: 1.5 },
+  { re: /leg curl|hamstring|swiss ball/, g: ["Hamstrings"], s: 0.6 },
+  { re: /hip thrust|glute bridge/, g: ["Glutes"], s: 1.75 },
+  { re: /deadlift|dead lift|sumo/, g: ["Hamstrings", "Back", "Glutes"], s: 2.0 },
+  { re: /calf/, g: ["Calves"], s: 2.0 },
+  { re: /incline.*(db|dumbbell|barbell|bench|press)/, g: ["Chest", "Shoulders"], s: 1.0 },
+  { re: /bench|chest press|\bfly\b|pec|push-?up|\bdip\b/, g: ["Chest", "Triceps"], s: 1.25 },
+  { re: /overhead.*press|\bohp\b|shoulder press|military|arnold/, g: ["Shoulders", "Triceps"], s: 0.8 },
+  { re: /lateral raise|side raise|rear delt|face pull|reverse fly/, g: ["Shoulders"], s: 0.25 },
+  { re: /shrug/, g: ["Back"], s: 1.6 },
+  { re: /row|pull-?up|chin-?up|pulldown|pull-?down|lat /, g: ["Back", "Biceps"], s: 1.1 },
+  { re: /curl/, g: ["Biceps"], s: 0.45 },
+  { re: /tricep|push-?down|press-?down|skull|kickback|close-?grip|overhead extension/, g: ["Triceps"], s: 0.5 },
+  { re: /crunch|sit-?up|leg raise|pallof|plank|oblique|knee raise|ab wheel|hollow/, g: ["Core"], s: 0.4 },
+];
+function e1RM(sets) {
+  let best = 0;
+  for (const s of sets || []) {
+    if (!s.w || !s.reps) continue;
+    best = Math.max(best, s.w * (1 + Math.min(s.reps, 12) / 30)); // Epley, capped reps
+  }
+  return best;
+}
+function analyzeStrength(lifts, bodyLb) {
+  const bw = bodyLb && bodyLb > 50 ? bodyLb : 175;
+  const buckets = {}; MUSCLES.forEach((m) => (buckets[m] = []));
+  let logged = 0;
+  for (const [key, hist] of Object.entries(lifts || {})) {
+    if (!hist || !hist.length) continue;
+    const best = Math.max(...hist.map((h) => e1RM(h.sets)));
+    if (!best) continue;
+    const std = EX_STD.find((e) => e.re.test(key));
+    if (!std) continue;
+    logged++;
+    const score = clamp((best / bw) / std.s * 100, 0, 110);
+    std.g.forEach((m) => buckets[m].push(score));
+  }
+  const groups = {};
+  MUSCLES.forEach((m) => { groups[m] = buckets[m].length ? Math.round(buckets[m].reduce((a, b) => a + b, 0) / buckets[m].length) : null; });
+  const graded = MUSCLES.filter((m) => groups[m] != null);
+  return { groups, graded, logged };
+}
+function strengthInsight(groups) {
+  const g = (m) => groups[m];
+  const avg = (arr) => { const v = arr.map(g).filter((x) => x != null); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+  const push = avg(["Chest", "Shoulders", "Triceps"]), pull = avg(["Back", "Biceps"]);
+  const quad = g("Quads"), ham = g("Hamstrings");
+  const out = [];
+  if (push != null && pull != null && Math.abs(push - pull) >= 12) out.push(push > pull ? "Push is ahead of pull — add rows, pull-ups, and face pulls." : "Pull is ahead of push — add pressing volume.");
+  if (quad != null && ham != null && Math.abs(quad - ham) >= 15) out.push(quad > ham ? "Quads outpace hamstrings — add RDLs and leg curls to protect the knee." : "Hamstrings lead quads — a little more squatting evens it out.");
+  const graded = MUSCLES.filter((m) => groups[m] != null);
+  if (graded.length >= 3) { const s = [...graded].sort((a, b) => groups[b] - groups[a]); out.push(`Strongest: ${s[0]}. Most room to grow: ${s[s.length - 1]}.`); }
+  return out.slice(0, 2);
+}
+function gradeColor(score) {
+  if (score == null) return "#E7EAEF";
+  if (score >= 75) return "#10B981";
+  if (score >= 55) return "#84CC16";
+  if (score >= 35) return "#FACC15";
+  if (score >= 18) return "#FB923C";
+  return "#F87171";
+}
+function gradeLabel(score) {
+  if (score == null) return "—";
+  if (score >= 75) return "Strong";
+  if (score >= 55) return "Solid";
+  if (score >= 35) return "Developing";
+  return "Focus";
 }
 
 /* ---------- AI ---------- */
@@ -355,15 +461,18 @@ async function estimateMacros(desc) {
   return { label: String(j.label || desc).slice(0, 40), cal: Math.max(0, Math.round(j.calories || 0)),
     p: Math.max(0, Math.round(j.protein_g || 0)), c: Math.max(0, Math.round(j.carbs_g || 0)), f: Math.max(0, Math.round(j.fat_g || 0)) };
 }
-async function estimateMacrosFromImage(dataUrl) {
+async function estimateMacrosFromImage(dataUrl, hint = "") {
   const m = dataUrl.match(/^data:(image\/[\w.+-]+);base64,(.+)$/);
   if (!m) throw new Error("bad image");
+  const ask = hint.trim()
+    ? `Estimate the nutrition of the food in this photo. The person adds these details to help you: "${hint.trim()}". Use them to refine portion size and ingredients.`
+    : "Estimate the nutrition of the food in this photo.";
   const out = await callClaude(
     [{ role: "user", content: [
       { type: "image", source: { type: "base64", media_type: m[1], data: m[2] } },
-      { type: "text", text: "Estimate the nutrition of the food in this photo." },
+      { type: "text", text: ask },
     ] }],
-    'You estimate nutrition from a food photo. Reply with ONLY a JSON object, no prose, no markdown: {"label":string,"calories":int,"protein_g":int,"carbs_g":int,"fat_g":int}. Identify the dish and estimate a realistic single serving as shown.',
+    'You estimate nutrition from a food photo. Reply with ONLY a JSON object, no prose, no markdown: {"label":string,"calories":int,"protein_g":int,"carbs_g":int,"fat_g":int}. Identify the dish and estimate a realistic single serving as shown, giving weight to any details the person provides.',
     400);
   const j = parseLoose(out);
   if (!j) throw new Error("bad");
@@ -472,6 +581,17 @@ function togetherOnDate(p, date) {
 }
 
 /* ---------- week scheduling ---------- */
+const REST_DOW = new Set([3, 0]); // Wed & Sun are rest days by default (spaced recovery)
+function inferFocus(access, title) {
+  const t = String(title || "").toLowerCase();
+  const list = FOCUS[access] || FOCUS.gym || [];
+  for (const f of list) { const w = f.toLowerCase().split(/[ &]/)[0]; if (w.length > 2 && t.includes(w)) return f; }
+  if (/\bleg|squat|quad|hamstring|lower|glute\b/.test(t)) return list.find((f) => /leg|lower/i.test(f)) || "custom";
+  if (/push|chest|\bpress\b/.test(t)) return list.find((f) => /push/i.test(f)) || "custom";
+  if (/pull|\bback\b|\brow\b|lat\b/.test(t)) return list.find((f) => /pull/i.test(f)) || "custom";
+  if (/\barm|bicep|tricep|curl\b/.test(t)) return list.find((f) => /arm/i.test(f)) || "custom";
+  return "custom";
+}
 function weekStartKey(d = new Date()) {
   const x = new Date(d); const back = (x.getDay() + 6) % 7; // Monday start
   x.setDate(x.getDate() - back); x.setHours(0, 0, 0, 0); return todayKey(x);
@@ -481,9 +601,11 @@ function weekDates(startKey) {
   for (let i = 0; i < 7; i++) { const d = new Date(s); d.setDate(s.getDate() + i); out.push(todayKey(d)); }
   return out;
 }
-// Build (or top up) a week of day-plans. force=true rebuilds every day;
-// otherwise existing days are kept (so edits and rest days survive). useAI
-// enriches with Claude, caching one call per unique (access, focus).
+const primaryFocus = (plan) => (plan?.slots || []).find((s) => !s.together)?.focus || null;
+// Build (or top up) a week of day-plans. Wed & Sun are rest (recovery — a
+// "together" session may still land there). Primary focus never repeats on
+// consecutive training days. force=true rebuilds every day; otherwise existing
+// days are kept. useAI enriches with Claude, caching per (access, focus).
 async function buildWeekPlans(p, wkStart, prefs, existing = {}, opts = {}) {
   const { force = false, useAI = false, note = "" } = opts;
   const dates = weekDates(wkStart);
@@ -492,22 +614,69 @@ async function buildWeekPlans(p, wkStart, prefs, existing = {}, opts = {}) {
   const n = p.sessionsPerDay === 2 ? 2 : 1;
   const cache = {};
   const out = {};
+  let lastFocus = null;
   for (let di = 0; di < dates.length; di++) {
     const dk = dates[di];
-    if (!force && existing[dk]) { out[dk] = existing[dk]; continue; }
-    const slots = [];
-    for (let i = 0; i < n; i++) {
-      const access = sessionAccess(accesses, i);
-      const order = orderByAccess[access] || ["Full-body strength"];
-      let focus = order[(di + i * (order.length > 1 ? 2 : 1)) % order.length];
-      if (slots.some((s) => s.focus === focus)) focus = order[(di + i + 3) % order.length];
-      const base = useAI ? await aiOrTemplate(p, access, focus, cache, note) : templateSlot(access, focus);
-      slots.push(placeSlot(base, i === 0 ? (p.mainTime || "Lunch") : (p.secondTime || "Evening")));
+    const dow = new Date(dk + "T00:00:00").getDay();
+    if (!force && existing[dk]) {
+      out[dk] = existing[dk];
+      const pf = primaryFocus(existing[dk]); if (pf && pf !== "together" && pf !== "custom") lastFocus = pf;
+      continue;
     }
-    if (togetherOnDate(p, dk)) slots.push({ ...placeSlot(togetherBase(dk), p.together?.time || "Evening"), together: true });
+    const slots = [];
+    if (!REST_DOW.has(dow)) {
+      for (let i = 0; i < n; i++) {
+        const access = sessionAccess(accesses, i);
+        const order = orderByAccess[access] || ["Full-body strength"];
+        let focus = order[(di + i) % order.length];
+        if (focus === lastFocus || slots.some((s) => s.focus === focus))
+          focus = order.find((f) => f !== lastFocus && !slots.some((s) => s.focus === f)) || focus;
+        const base = useAI ? await aiOrTemplate(p, access, focus, cache, note) : templateSlot(access, focus);
+        slots.push(placeSlot(base, i === 0 ? (p.mainTime || "Lunch") : (p.secondTime || "Evening")));
+        if (i === 0) lastFocus = focus;
+      }
+    }
+    if (!REST_DOW.has(dow) && togetherOnDate(p, dk)) slots.push({ ...placeSlot(togetherBase(dk), p.together?.time || "Evening"), together: true });
     out[dk] = { slots };
   }
   return out;
+}
+// After a day's focus changes, walk forward and re-roll only the auto training
+// days that now repeat the previous day's focus (so no two leg days in a row).
+async function resequenceForward(p, prefs, plans, dates, fromDk) {
+  const startIdx = dates.indexOf(fromDk);
+  if (startIdx < 0) return { plans, changed: [] };
+  const accesses = accessesOf(p);
+  const orderByAccess = {}; accesses.forEach((a) => (orderByAccess[a] = focusOrder(a, prefs)));
+  const n = p.sessionsPerDay === 2 ? 2 : 1;
+  const useAI = !!AI_PROXY;
+  const cache = {};
+  const updated = { ...plans };
+  const changed = [];
+  let lastFocus = primaryFocus(updated[fromDk]);
+  for (let i = startIdx + 1; i < dates.length; i++) {
+    const d = dates[i];
+    const plan = updated[d];
+    const primaries = (plan?.slots || []).filter((s) => !s.together);
+    const isAuto = primaries.length > 0 && primaries.every((s) => s.focus && s.focus !== "custom" && !s.done && !s.skipped);
+    const curFocus = primaryFocus(plan);
+    if (!isAuto || curFocus == null) { if (curFocus && curFocus !== "together" && curFocus !== "custom") lastFocus = curFocus; continue; }
+    if (curFocus !== lastFocus) { lastFocus = curFocus; continue; }
+    const together = (plan.slots || []).filter((s) => s.together);
+    const newSlots = [];
+    for (let k = 0; k < n; k++) {
+      const access = sessionAccess(accesses, k);
+      const order = orderByAccess[access] || ["Full-body strength"];
+      let focus = order.find((f) => f !== lastFocus && !newSlots.some((s) => s.focus === f)) || order[(i + k) % order.length];
+      const base = useAI ? await aiOrTemplate(p, access, focus, cache, "") : templateSlot(access, focus);
+      newSlots.push(placeSlot(base, k === 0 ? (p.mainTime || "Lunch") : (p.secondTime || "Evening")));
+      if (k === 0) lastFocus = focus;
+    }
+    together.forEach((t) => newSlots.push(t));
+    updated[d] = { slots: newSlots };
+    changed.push(d);
+  }
+  return { plans: updated, changed };
 }
 function bumpPref(prefs, focus, kind) {
   const q = { like: { ...(prefs?.like || {}) }, skip: { ...(prefs?.skip || {}) } };
@@ -1002,6 +1171,8 @@ function Food({ me, log, onSave }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [cw, setCw] = useState("");
+  const [photoData, setPhotoData] = useState(null);
+  const [photoHint, setPhotoHint] = useState("");
   const fileRef = useRef(null);
   const food = log?.food || [], alcohol = log?.alcohol || [];
   const aiOn = !!AI_PROXY;
@@ -1018,9 +1189,15 @@ function Food({ me, log, onSave }) {
     const f = e.target.files?.[0]; e.target.value = "";
     if (!f) return;
     if (!aiOn) { setErr("Photo needs AI turned on. Use Manual to type the numbers."); return; }
-    setMode(null); setBusy(true); setErr("");
-    try { const { dataUrl } = await fileToThumb(f, 800); const r = await estimateMacrosFromImage(dataUrl); openDraft(r); }
-    catch (e2) { setErr("Couldn't read that photo — type the numbers in below."); openDraft({}); }
+    setErr(""); setDraft(null); setPhotoHint("");
+    try { const { dataUrl } = await fileToThumb(f, 800); setPhotoData(dataUrl); setMode("photo"); }
+    catch (e2) { setErr("Couldn't read that photo — try again or use Manual."); }
+  }
+  async function estimatePhoto() {
+    if (!photoData) return;
+    setBusy(true); setErr("");
+    try { const r = await estimateMacrosFromImage(photoData, photoHint); openDraft(r); setPhotoData(null); setPhotoHint(""); setMode(null); }
+    catch (e2) { setErr("Couldn't read that photo — type the numbers in below."); openDraft({}); setPhotoData(null); setMode(null); }
     setBusy(false);
   }
   function addDraft() {
@@ -1081,6 +1258,21 @@ function Food({ me, log, onSave }) {
             </div>
             <div className="f-body" style={{ fontSize: 12, color: "#9097A1", marginTop: 8 }}>Describe it or snap a photo and Tandem estimates the macros. Use Manual to type them off a label.</div>
           </>
+        )}
+        {mode === "photo" && photoData && (
+          <div style={{ marginTop: 12 }}>
+            <div style={{ display: "flex", gap: 12, marginBottom: 10 }}>
+              <img src={photoData} alt="" style={{ width: 72, height: 72, borderRadius: 12, objectFit: "cover", flexShrink: 0 }} />
+              <div style={{ flex: 1 }}>
+                <TextInput value={photoHint} placeholder="Optional: add details — 'large bowl, extra rice, olive oil'" onChange={(e) => setPhotoHint(e.target.value)} onKeyDown={(e) => e.key === "Enter" && estimatePhoto()} />
+                <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 6 }}>Details make the estimate more accurate — portion size, hidden ingredients, brand.</div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Btn kind="outline" size="sm" onClick={() => { setPhotoData(null); setPhotoHint(""); setMode(null); }}>Cancel</Btn>
+              <Btn full size="sm" color={VIOLET} disabled={busy} onClick={estimatePhoto}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Wand2 className="w-4 h-4" />} Estimate from photo</Btn>
+            </div>
+          </div>
         )}
         {busy && !draft && <div className="f-body" style={{ fontSize: 12.5, color: "#9097A1", marginTop: 10, display: "flex", alignItems: "center", gap: 7 }}><RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> Reading…</div>}
         {err && <div className="f-body" style={{ fontSize: 12.5, color: "#C2410C", marginTop: 10 }}>{err}</div>}
@@ -1180,14 +1372,17 @@ function Food({ me, log, onSave }) {
    TRAIN
    ============================================================ */
 const TYPE_ICON = { strength: Dumbbell, cardio: Activity, run: Footprints, mobility: Bike, bike: Bike, other: Activity };
-function SlotRow({ slot, accent, onToggle, onSub, onRemove, onEdit, onStart, compact }) {
+function SlotRow({ slot, accent, onToggle, onSub, onRemove, onEdit, onStart, onSkip, onAiChange, aiOn, compact }) {
   const [open, setOpen] = useState(false);
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiText, setAiText] = useState("");
   const Icon = TYPE_ICON[slot.type] || Dumbbell;
   const metrics = [];
   if (slot.distance) metrics.push(`${slot.distance} mi`);
   if (slot.calories) metrics.push(`${slot.calories} cal`);
   const hasDetail = (slot.exercises || []).length > 0 || slot.notes;
-  const canStart = onStart && slot.type === "strength" && !slot.custom && !slot.together && !slot.done && (slot.exercises || []).length > 0;
+  const dim = slot.done || slot.skipped;
+  const canStart = onStart && slot.type === "strength" && !slot.custom && !slot.together && !slot.done && !slot.skipped && (slot.exercises || []).length > 0;
   return (
     <Card style={{ padding: 0, overflow: "hidden", borderColor: slot.done ? accent + "55" : "#EBEEF2" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: 14 }}>
@@ -1201,9 +1396,10 @@ function SlotRow({ slot, accent, onToggle, onSub, onRemove, onEdit, onStart, com
         )}
         <div style={{ flex: 1, minWidth: 0 }} onClick={() => !compact && setOpen(!open)}>
           <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-            <span className="f-body" style={{ fontSize: 14.5, fontWeight: 600, color: INK, textDecoration: slot.done ? "line-through" : "none", opacity: slot.done ? 0.55 : 1 }}>{slot.title}</span>
+            <span className="f-body" style={{ fontSize: 14.5, fontWeight: 600, color: INK, textDecoration: dim ? "line-through" : "none", opacity: dim ? 0.5 : 1 }}>{slot.title}</span>
             {slot.together && <span className="f-body" style={{ fontSize: 10, fontWeight: 700, color: "#fff", background: VIOLET, padding: "2px 6px", borderRadius: 6 }}>TOGETHER</span>}
             {slot.custom && <span className="f-body" style={{ fontSize: 10, fontWeight: 700, color: "#fff", background: "#10B981", padding: "2px 6px", borderRadius: 6 }}>LOGGED</span>}
+            {slot.skipped && <span className="f-body" style={{ fontSize: 10, fontWeight: 700, color: "#fff", background: "#A6ACB5", padding: "2px 6px", borderRadius: 6 }}>SKIPPED</span>}
           </div>
           <div className="f-body" style={{ fontSize: 12, color: "#9097A1", display: "flex", gap: 8, marginTop: 2, flexWrap: "wrap" }}>
             <span><Clock className="w-3 h-3" style={{ display: "inline", marginRight: 3, verticalAlign: "-1px" }} />{slot.time}</span>
@@ -1232,11 +1428,19 @@ function SlotRow({ slot, accent, onToggle, onSub, onRemove, onEdit, onStart, com
             </div>
           )}
           {slot.notes && <div className="f-body" style={{ fontSize: 13, color: "#6B7280", marginTop: hasDetail ? 10 : 0, background: "#F6F7F9", borderRadius: 10, padding: "10px 12px", lineHeight: 1.5 }}>{slot.notes}</div>}
-          {(onSub || onRemove || onEdit) && (
+          {(onSub || onRemove || onEdit || onSkip || onAiChange) && (
             <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
               {onEdit && <Btn kind="outline" size="sm" onClick={() => onEdit(slot.id)}><Edit3 className="w-3.5 h-3.5" /> Edit</Btn>}
+              {onAiChange && aiOn && !slot.custom && !slot.together && <Btn kind="soft" color={VIOLET} size="sm" onClick={() => setAiOpen(!aiOpen)}><Sparkles className="w-3.5 h-3.5" /> AI change</Btn>}
               {onSub && !slot.custom && <Btn kind="outline" size="sm" onClick={() => onSub(slot.id)}><RefreshCw className="w-3.5 h-3.5" /> Swap</Btn>}
+              {onSkip && !slot.custom && <Btn kind="outline" size="sm" onClick={() => onSkip(slot.id)}>{slot.skipped ? "Unskip" : "Skip"}</Btn>}
               {onRemove && <Btn kind="outline" size="sm" onClick={() => onRemove(slot.id)}><Trash2 className="w-3.5 h-3.5" /> Remove</Btn>}
+            </div>
+          )}
+          {aiOpen && onAiChange && (
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <TextInput value={aiText} placeholder="e.g. more chest · easier · add biceps · make it 30 min" onChange={(e) => setAiText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && aiText.trim()) { onAiChange(slot.id, aiText.trim()); setAiText(""); setAiOpen(false); } }} />
+              <Btn color={VIOLET} size="sm" disabled={!aiText.trim()} onClick={() => { onAiChange(slot.id, aiText.trim()); setAiText(""); setAiOpen(false); }}><Sparkles className="w-4 h-4" /></Btn>
             </div>
           )}
         </div>
@@ -1244,12 +1448,16 @@ function SlotRow({ slot, accent, onToggle, onSub, onRemove, onEdit, onStart, com
     </Card>
   );
 }
-function WeekDay({ dk, plan, isToday, accent, me, prefs, busy, on }) {
+function WeekDay({ dk, plan, isToday, accent, me, prefs, busy, aiOn, on }) {
   const [open, setOpen] = useState(isToday);
+  const [dayAi, setDayAi] = useState(false);
+  const [dayText, setDayText] = useState("");
   const slots = plan?.slots || [];
-  const done = slots.filter((s) => s.done).length;
+  const active = slots.filter((s) => !s.skipped);
+  const done = active.filter((s) => s.done).length;
   const exists = !!plan; // a saved (possibly empty / rest) day
   const wname = new Date(dk + "T00:00:00").toLocaleDateString(undefined, { weekday: "short" });
+  const submitDay = () => { if (dayText.trim()) { on.aiDay(dk, dayText.trim(), slots.length > 0); setDayText(""); setDayAi(false); } };
   return (
     <Card style={{ padding: 0, overflow: "hidden", borderColor: isToday ? accent + "66" : "#EBEEF2" }}>
       <button onClick={() => setOpen(!open)} className="f-body"
@@ -1266,14 +1474,14 @@ function WeekDay({ dk, plan, isToday, accent, me, prefs, busy, on }) {
               </div>}
         </div>
         {isToday && <span className="f-body" style={{ fontSize: 10, fontWeight: 700, color: "#fff", background: accent, padding: "2px 7px", borderRadius: 6 }}>TODAY</span>}
-        {slots.length > 0 && <span className="f-disp tnum" style={{ fontSize: 12, color: done === slots.length ? "#10B981" : "#9097A1" }}>{done}/{slots.length}</span>}
+        {active.length > 0 && <span className="f-disp tnum" style={{ fontSize: 12, color: done === active.length ? "#10B981" : "#9097A1" }}>{done}/{active.length}</span>}
         <ChevronDown className="w-4 h-4" style={{ color: "#C7CDD6", transform: open ? "rotate(180deg)" : "none", transition: "transform .2s" }} />
       </button>
       {open && (
         <div style={{ padding: "0 12px 12px" }}>
           {slots.map((sl) => (
             <div key={sl.id}>
-              <SlotRow slot={sl} accent={accent} onToggle={(id) => on.toggle(dk, id)} onSub={(id) => on.swap(dk, id)} onRemove={(id) => on.remove(dk, id)} onEdit={(id) => on.edit(dk, id)} onStart={(slot) => on.start(dk, slot)} />
+              <SlotRow slot={sl} accent={accent} aiOn={aiOn} onToggle={(id) => on.toggle(dk, id)} onSub={(id) => on.swap(dk, id)} onRemove={(id) => on.remove(dk, id)} onEdit={(id) => on.edit(dk, id)} onStart={(slot) => on.start(dk, slot)} onSkip={(id) => on.skip(dk, id)} onAiChange={(id, text) => on.aiSlot(dk, id, text)} />
               <div style={{ display: "flex", gap: 6, margin: "-6px 0 12px 4px", flexWrap: "wrap" }}>
                 {TIMES.map((tm) => (
                   <button key={tm} onClick={() => on.reschedule(dk, sl.id, tm)} className="f-body" style={{ fontSize: 11.5, padding: "4px 9px", borderRadius: 8, cursor: "pointer",
@@ -1282,7 +1490,14 @@ function WeekDay({ dk, plan, isToday, accent, me, prefs, busy, on }) {
               </div>
             </div>
           ))}
+          {dayAi && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+              <TextInput value={dayText} placeholder={slots.length ? "e.g. add a core finisher · make it legs" : "e.g. add an easy 30-min run"} onChange={(e) => setDayText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submitDay()} />
+              <Btn color={VIOLET} size="sm" disabled={busy || !dayText.trim()} onClick={submitDay}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-4 h-4" />}</Btn>
+            </div>
+          )}
           <div style={{ display: "flex", gap: 8, marginTop: 4, flexWrap: "wrap" }}>
+            {aiOn && <Btn kind="soft" color={VIOLET} size="sm" disabled={busy} onClick={() => setDayAi(!dayAi)}><Sparkles className="w-3.5 h-3.5" /> Ask AI</Btn>}
             <Btn kind="soft" color={accent} size="sm" onClick={() => on.addCustom(dk)}><Plus className="w-3.5 h-3.5" /> Add what I did</Btn>
             <Btn kind="outline" size="sm" disabled={busy} onClick={() => on.addSession(dk)}><Plus className="w-3.5 h-3.5" /> Plan a session</Btn>
             {slots.length > 0 && <Btn kind="outline" size="sm" disabled={busy} onClick={() => on.restDay(dk)}>Rest day</Btn>}
@@ -1360,7 +1575,37 @@ function SessionEditor({ me, slot, onSave, onClose }) {
     </div>
   );
 }
-function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref, onStart }) {
+const RECOVERY = {
+  line: "Contrast therapy + protein between sessions.",
+  steps: [
+    "Alternate sauna or hot springs (~3–4 min) with a cold plunge (~1 min). 3–5 rounds, ~20 min, finish on cold.",
+    "30g protein within an hour of training.",
+    "Easy yoga or mobility on rest days to stay loose.",
+  ],
+};
+function RecoveryNote() {
+  const [open, setOpen] = useState(false);
+  return (
+    <Card style={{ background: "#F6F7F9", border: "none" }}>
+      <button onClick={() => setOpen(!open)} className="f-body" style={{ width: "100%", background: "none", border: "none", cursor: "pointer", padding: 0, display: "flex", alignItems: "center", gap: 8, textAlign: "left" }}>
+        <Leaf className="w-4 h-4" style={{ color: "#10B981", flexShrink: 0 }} />
+        <span style={{ flex: 1, fontSize: 13.5, fontWeight: 600, color: INK }}>Recovery</span>
+        {!open && <span className="f-body" style={{ fontSize: 12, color: "#9097A1", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 150 }}>{RECOVERY.line}</span>}
+        <ChevronDown className="w-4 h-4" style={{ color: "#C7CDD6", transform: open ? "rotate(180deg)" : "none", transition: "transform .2s", flexShrink: 0 }} />
+      </button>
+      {open && (
+        <div style={{ marginTop: 10 }}>
+          {RECOVERY.steps.map((s, i) => (
+            <div key={i} className="f-body" style={{ fontSize: 12.5, color: "#4B5563", lineHeight: 1.55, display: "flex", gap: 8, marginBottom: 6 }}>
+              <span style={{ color: "#10B981", fontWeight: 700 }}>·</span><span>{s}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+function Train({ me, week, prefs, onSaveDay, onChangeDay, onGenWeek, onPref, onStart, aiWeekBusy }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(null); // { dk, slot } — slot null = add custom
   const [req, setReq] = useState("");
@@ -1371,20 +1616,36 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref, onStart }) {
   const plans = week?.plans || {};
   const dates = week?.dates || weekDates(weekStartKey());
 
-  async function applyChange(toWeek) {
+  async function applyWeekChange() {
     const r = req.trim(); if (!r) return;
     setBusy(true);
+    try { await onGenWeek(true, r); setReq(""); } catch (e) { /* keep text */ }
+    setBusy(false);
+  }
+  async function aiChangeDay(dk, request, addOnly) {
+    setBusy(true);
     try {
-      if (toWeek) {
-        await onGenWeek(true, r);
-      } else {
-        const sessions = await aiAdjustDay(me, plans[today]?.slots || [], r);
-        const times = [me.mainTime || "Lunch", me.secondTime || "Evening"];
-        const slots = sessions.map((s, i) => placeSlot({ title: s.title, focus: "custom", access: accessesOf(me)[0], type: s.type, duration: s.duration_min, location: "", exercises: s.exercises || [] }, times[i] || "Evening"));
-        await onSaveDay(today, { slots });
-      }
-      setReq("");
-    } catch (e) { /* leave text so they can retry */ }
+      const plan = plans[dk] || { slots: [] };
+      const sessions = await aiAdjustDay(me, plan.slots || [], request);
+      const times = [me.mainTime || "Lunch", me.secondTime || "Evening"];
+      const together = (plan.slots || []).filter((s) => s.together);
+      const access = accessesOf(me)[0];
+      const built = sessions.map((s, i) => placeSlot({ title: s.title, focus: inferFocus(access, s.title), access, type: s.type, duration: s.duration_min, location: "", exercises: s.exercises || [] }, times[i] || "Evening"));
+      await onChangeDay(dk, { slots: [...built, ...together] });
+    } catch (e) {}
+    setBusy(false);
+  }
+  async function aiChangeSlot(dk, id, request) {
+    setBusy(true);
+    try {
+      const plan = plans[dk] || { slots: [] };
+      const cur = plan.slots.find((s) => s.id === id); if (!cur) { setBusy(false); return; }
+      const sessions = await aiAdjustDay(me, [cur], request);
+      const s0 = sessions[0];
+      const access = cur.access && cur.access !== "together" ? cur.access : accessesOf(me)[0];
+      const repl = { ...placeSlot({ title: s0.title, focus: inferFocus(access, s0.title), access, type: s0.type, duration: s0.duration_min, location: cur.location || "", exercises: s0.exercises || [] }, cur.time), id: cur.id };
+      await onChangeDay(dk, { slots: plan.slots.map((s) => (s.id === id ? repl : s)) });
+    } catch (e) {}
     setBusy(false);
   }
 
@@ -1394,11 +1655,17 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref, onStart }) {
   }
   const on = {
     start(dk, slot) { onStart(dk, slot); },
+    skip(dk, id) {
+      const plan = plans[dk] || { slots: [] };
+      onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? { ...s, skipped: !s.skipped, done: false } : s)) });
+    },
+    aiDay(dk, request, addOnly) { return aiChangeDay(dk, request, addOnly); },
+    aiSlot(dk, id, request) { return aiChangeSlot(dk, id, request); },
     toggle(dk, id) {
       const plan = plans[dk] || { slots: [] };
       const slot = plan.slots.find((s) => s.id === id);
       if (slot && !slot.done) onPref(slot.focus, "like");
-      onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? { ...s, done: !s.done } : s)) });
+      onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? { ...s, done: !s.done, skipped: false } : s)) });
     },
     remove(dk, id) {
       const plan = plans[dk] || { slots: [] };
@@ -1422,13 +1689,14 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref, onStart }) {
         const others = TOGETHER_POOL.filter((t) => t.title !== cur.title);
         const pick = others[Math.floor(Math.random() * others.length)];
         repl = { ...placeSlot({ title: pick.title, focus: "together", access: "together", type: pick.type, duration: pick.duration, location: pick.location, exercises: expand(pick.ex) }, cur.time), together: true };
+        onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? repl : s)) });
       } else {
         onPref(cur.focus, "skip");
         const order = focusOrder(cur.access, prefs).filter((f) => f !== cur.focus);
         const nf = order[Math.floor(Math.random() * order.length)] || cur.focus;
         repl = placeSlot(await buildOne(cur.access, nf), cur.time);
+        await onChangeDay(dk, { slots: plan.slots.map((s) => (s.id === id ? repl : s)) });
       }
-      onSaveDay(dk, { slots: plan.slots.map((s) => (s.id === id ? repl : s)) });
       setBusy(false);
     },
     async addSession(dk) {
@@ -1448,18 +1716,16 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref, onStart }) {
   async function gen(useAI) { setBusy(true); await onGenWeek(useAI); setBusy(false); }
   function saveSession(dk, data) {
     const plan = plans[dk] || { slots: [] };
-    let slots;
     if (data.id && plan.slots.some((s) => s.id === data.id)) {
-      slots = plan.slots.map((s) => (s.id === data.id ? { ...s, ...data } : s));
+      onChangeDay(dk, { slots: plan.slots.map((s) => (s.id === data.id ? { ...s, ...data } : s)) });
     } else {
-      slots = [...plan.slots, { ...data, id: uid(), done: true, custom: true }];
+      onSaveDay(dk, { slots: [...plan.slots, { ...data, id: uid(), done: true, custom: true }] });
     }
-    onSaveDay(dk, { slots });
     setEditing(null);
   }
 
   let wkDone = 0, wkTotal = 0;
-  dates.forEach((d) => { const s = plans[d]?.slots || []; wkDone += s.filter((x) => x.done).length; wkTotal += s.length; });
+  dates.forEach((d) => { const s = (plans[d]?.slots || []).filter((x) => !x.skipped); wkDone += s.filter((x) => x.done).length; wkTotal += s.length; });
 
   return (
     <Screen>
@@ -1469,30 +1735,25 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref, onStart }) {
           <Ring value={wkTotal ? wkDone / wkTotal : 0} color={accent} size={56}><span className="f-disp tnum" style={{ fontSize: 13, fontWeight: 700, color: INK }}>{wkDone}/{wkTotal}</span></Ring>
           <div style={{ flex: 1 }}>
             <div className="f-body" style={{ fontWeight: 600, color: INK, fontSize: 15 }}>This week</div>
-            <div className="f-body" style={{ fontSize: 12.5, color: "#9097A1" }}>Auto-built and rotating. Tap any day to tweak it.</div>
+            <div className="f-body" style={{ fontSize: 12.5, color: "#9097A1" }}>{aiWeekBusy ? "Personalizing your week…" : "Auto-built each week. Rest on Wed & Sun."}</div>
           </div>
         </div>
-        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
-          {aiOn
-            ? <Btn full color={VIOLET} size="sm" disabled={busy} onClick={() => gen(true)}>
-                {busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-4 h-4" />} Generate week with AI
-              </Btn>
-            : <Btn full color={accent} size="sm" disabled={busy} onClick={() => gen(false)}>
-                {busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <RefreshCw className="w-4 h-4" />} Rebuild week
-              </Btn>}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>
+          <button onClick={() => gen(aiOn)} disabled={busy || aiWeekBusy} className="f-body" style={{ background: "none", border: "none", cursor: busy ? "default" : "pointer", color: "#9097A1", fontSize: 12.5, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 6, padding: 0 }}>
+            <RefreshCw className="w-3.5 h-3.5" style={{ animation: (busy || aiWeekBusy) ? "spin 1s linear infinite" : "none" }} /> Regenerate this week{aiOn ? " with AI" : ""}
+          </button>
         </div>
-        {!aiOn && <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 8 }}>Turn on AI (see setup) and Tandem will write each week's workouts for you — and learn what you keep vs. skip.</div>}
-        {aiOn && <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 8 }}>AI learns from what you finish vs. swap away, and leans your week toward what you like.</div>}
+        {!aiOn && <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 8 }}>Turn on AI (see setup) and Tandem writes each week for you — and learns what you keep vs. skip.</div>}
       </Card>
 
       {aiOn && (
         <Card>
-          <div className="f-body" style={{ fontWeight: 600, color: INK, fontSize: 14, marginBottom: 8, display: "flex", alignItems: "center", gap: 7 }}><Wand2 className="w-4 h-4" style={{ color: VIOLET }} /> Ask the coach to change it</div>
-          <textarea className="f-body" value={req} placeholder="e.g. make today arms & shoulders only · add a Pallof press · swap Wednesday for a run · more RPE-8 supersets this week" onChange={(e) => setReq(e.target.value)} style={{ ...inputStyle, minHeight: 56, resize: "vertical", lineHeight: 1.5 }} />
+          <div className="f-body" style={{ fontWeight: 600, color: INK, fontSize: 14, marginBottom: 8, display: "flex", alignItems: "center", gap: 7 }}><Wand2 className="w-4 h-4" style={{ color: VIOLET }} /> Ask the coach to reshape the week</div>
+          <textarea className="f-body" value={req} placeholder="e.g. more upper-body volume · add a Pallof press to leg days · swap in more RPE-8 supersets · easier deload week" onChange={(e) => setReq(e.target.value)} style={{ ...inputStyle, minHeight: 56, resize: "vertical", lineHeight: 1.5 }} />
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-            <Btn kind="soft" color={accent} size="sm" disabled={busy || !req.trim()} onClick={() => applyChange(false)}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-4 h-4" />} Apply to today</Btn>
-            <Btn kind="soft" color={VIOLET} size="sm" disabled={busy || !req.trim()} onClick={() => applyChange(true)}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-4 h-4" />} Apply to week</Btn>
+            <Btn full kind="soft" color={VIOLET} size="sm" disabled={busy || aiWeekBusy || !req.trim()} onClick={applyWeekChange}>{busy ? <RefreshCw className="w-4 h-4" style={{ animation: "spin 1s linear infinite" }} /> : <Sparkles className="w-4 h-4" />} Apply to this week</Btn>
           </div>
+          <div className="f-body" style={{ fontSize: 11.5, color: "#9097A1", marginTop: 8 }}>To change a single day or one workout, use the <b>✨ AI</b> buttons on that day below.</div>
         </Card>
       )}
 
@@ -1509,8 +1770,9 @@ function Train({ me, week, prefs, onSaveDay, onGenWeek, onPref, onStart }) {
       )}
 
       {dates.map((dk) => (
-        <WeekDay key={dk} dk={dk} plan={plans[dk]} isToday={dk === today} accent={accent} me={me} prefs={prefs} busy={busy} on={on} />
+        <WeekDay key={dk} dk={dk} plan={plans[dk]} isToday={dk === today} accent={accent} me={me} prefs={prefs} busy={busy} aiOn={aiOn} on={on} />
       ))}
+      <RecoveryNote />
       {editing && <SessionEditor me={me} slot={editing.slot} onSave={(data) => saveSession(editing.dk, data)} onClose={() => setEditing(null)} />}
       <div style={{ height: 8 }} />
     </Screen>
@@ -1572,7 +1834,63 @@ function BodyDiagram({ latestM, measures, accent }) {
     </svg>
   );
 }
-function Progress({ me, data, busy, onLogWeight, onLogMeasure, onAddPhoto, onDeletePhoto }) {
+function StrengthMap({ lifts, bodyLb, accent }) {
+  const { groups, graded, logged } = analyzeStrength(lifts, bodyLb);
+  if (logged < 3) {
+    return <div className="f-body" style={{ fontSize: 13, color: "#9097A1", textAlign: "center", padding: "10px 4px", lineHeight: 1.5 }}>Log a handful of different lifts in <b>Gym Mode</b> and your strength map fills in here — where you're ahead, and where to focus.</div>;
+  }
+  const outline = (
+    <g fill="#EDEFF2" stroke="#DDE1E6" strokeWidth="2" strokeLinejoin="round">
+      <circle cx="130" cy="32" r="18" />
+      <path d="M114,52 L146,52 Q156,54 154,64 L150,120 Q149,134 142,152 L118,152 Q111,134 110,120 L106,64 Q104,54 114,52 Z" />
+      <rect x="92" y="62" width="13" height="76" rx="6.5" transform="rotate(7 98 100)" />
+      <rect x="155" y="62" width="13" height="76" rx="6.5" transform="rotate(-7 162 100)" />
+      <rect x="115" y="150" width="13" height="150" rx="6.5" />
+      <rect x="132" y="150" width="13" height="150" rx="6.5" />
+    </g>
+  );
+  const frontZones = [
+    { m: "Shoulders", e: [[108, 64, 10, 7], [152, 64, 10, 7]] },
+    { m: "Chest", e: [[130, 88, 20, 13]] },
+    { m: "Biceps", e: [[99, 104, 7, 13], [161, 104, 7, 13]] },
+    { m: "Core", e: [[130, 130, 15, 20]] },
+    { m: "Quads", e: [[121, 205, 8, 30], [139, 205, 8, 30]] },
+  ];
+  const backZones = [
+    { m: "Back", e: [[130, 92, 23, 28]] },
+    { m: "Triceps", e: [[99, 104, 7, 13], [161, 104, 7, 13]] },
+    { m: "Glutes", e: [[130, 154, 19, 13]] },
+    { m: "Hamstrings", e: [[121, 212, 8, 26], [139, 212, 8, 26]] },
+    { m: "Calves", e: [[121, 272, 7, 15], [139, 272, 7, 15]] },
+  ];
+  const zonesEls = (zones) => zones.flatMap((z) => z.e.map(([cx, cy, rx, ry], i) => (
+    <ellipse key={z.m + i} cx={cx} cy={cy} rx={rx} ry={ry} fill={gradeColor(groups[z.m])} opacity={groups[z.m] == null ? 0.45 : 0.85} />
+  )));
+  const ranked = [...graded].sort((a, b) => groups[b] - groups[a]);
+  const insights = strengthInsight(groups);
+  return (
+    <>
+      <svg viewBox="0 0 300 195" style={{ width: "100%", maxWidth: 340, display: "block", margin: "0 auto" }}>
+        <g transform="translate(2,6) scale(0.46)">{outline}{zonesEls(frontZones)}</g>
+        <g transform="translate(158,6) scale(0.46)">{outline}{zonesEls(backZones)}</g>
+        <text x="62" y="184" textAnchor="middle" className="f-body" style={{ fontSize: 11, fontWeight: 600, fill: "#9097A1" }}>Front</text>
+        <text x="218" y="184" textAnchor="middle" className="f-body" style={{ fontSize: 11, fontWeight: 600, fill: "#9097A1" }}>Back</text>
+      </svg>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 12 }}>
+        {ranked.map((m) => (
+          <span key={m} className="f-body" style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, color: "#374151", background: "#F6F7F9", borderRadius: 9, padding: "5px 9px" }}>
+            <span style={{ width: 9, height: 9, borderRadius: 5, background: gradeColor(groups[m]) }} />{m}<span style={{ color: "#9097A1", fontWeight: 500 }}>{gradeLabel(groups[m])}</span>
+          </span>
+        ))}
+      </div>
+      {insights.map((t, i) => (
+        <div key={i} className="f-body" style={{ fontSize: 12.5, color: "#4B5563", marginTop: 8, display: "flex", gap: 7 }}><TrendingUp className="w-4 h-4" style={{ color: accent, flexShrink: 0 }} />{t}</div>
+      ))}
+      <div className="f-body" style={{ fontSize: 11, color: "#B6BCC4", marginTop: 10, lineHeight: 1.5 }}>A rough estimate from your logged lifts, normalized to bodyweight — good for spotting imbalances, not a medical assessment.</div>
+    </>
+  );
+}
+function Progress({ me, data, busy, lifts, onLogWeight, onLogMeasure, onAddPhoto, onDeletePhoto }) {
   const [showW, setShowW] = useState(false);
   const [showM, setShowM] = useState(false);
   const [wVal, setWVal] = useState("");
@@ -1681,6 +1999,12 @@ function Progress({ me, data, busy, onLogWeight, onLogMeasure, onAddPhoto, onDel
             <MiniLine values={weightVals} color={accentHex(me.accent)} />
           </>
         ) : <Empty icon={Scale} title="No weigh-ins yet" sub="Tap Log to add your first." />}
+      </Card>
+
+      {/* strength balance */}
+      <SectionTitle>Strength balance</SectionTitle>
+      <Card>
+        <StrengthMap lifts={lifts} bodyLb={+me.weightLb || 0} accent={accent} />
       </Card>
 
       {/* measurements */}
@@ -1918,7 +2242,7 @@ function GymMode({ slot, me, lifts, accent, onFinish, onClose }) {
   const restRef = useRef(null);
   const [log, setLog] = useState(() => exercises.map((e) => {
     const t = parseTarget(e.detail);
-    const sug = suggestLoad((lifts || {})[liftKey(e.name)], t, e.name);
+    const sug = suggestLoad((lifts || {})[liftKey(e.name)], t, e.name, +me.weightLb || 0);
     const w = sug ? String(sug.next) : "";
     return { sets: Array.from({ length: t.sets }, () => ({ w, reps: "", done: false })) };
   }));
@@ -1935,7 +2259,7 @@ function GymMode({ slot, me, lifts, accent, onFinish, onClose }) {
   }
   const ex = exercises[idx];
   const t = parseTarget(ex.detail);
-  const sug = suggestLoad((lifts || {})[liftKey(ex.name)], t, ex.name);
+  const sug = suggestLoad((lifts || {})[liftKey(ex.name)], t, ex.name, +me.weightLb || 0);
   const cur = log[idx];
   const setField = (si, f, v) => setLog((L) => L.map((x, i) => i === idx ? { ...x, sets: x.sets.map((s, j) => j === si ? { ...s, [f]: v } : s) } : x));
   function checkSet(si) {
@@ -1966,6 +2290,10 @@ function GymMode({ slot, me, lifts, accent, onFinish, onClose }) {
         <Field label="Calories burned (optional)" hint="From your watch — Apple, Garmin, whatever it says.">
           <TextInput type="number" inputMode="numeric" value={cal} placeholder="e.g. 480" onChange={(e) => setCal(e.target.value)} />
         </Field>
+        <div style={{ background: "#F6F7F9", borderRadius: 12, padding: "11px 13px", margin: "2px 0 6px" }}>
+          <div className="f-body" style={{ fontSize: 12.5, fontWeight: 600, color: "#374151", display: "flex", alignItems: "center", gap: 7, marginBottom: 3 }}><Leaf className="w-4 h-4" style={{ color: "#10B981" }} /> Recovery</div>
+          <div className="f-body" style={{ fontSize: 12, color: "#6B7280", lineHeight: 1.5 }}>{RECOVERY.steps[0]} Then 30g protein within the hour.</div>
+        </div>
         <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
           <Btn kind="outline" onClick={() => setFinishing(false)}>Back</Btn>
           <Btn full color={accent} onClick={doFinish}><Check className="w-4 h-4" /> Save workout</Btn>
@@ -1999,7 +2327,7 @@ function GymMode({ slot, me, lifts, accent, onFinish, onClose }) {
       <div className="f-body" style={{ fontSize: 13, color: "#7A828D", marginTop: 2 }}>{ex.detail || "Log your sets"}</div>
       <div className="f-body" style={{ fontSize: 12.5, marginTop: 10, marginBottom: 16, color: sug ? INK : "#6B7280", background: "#F6F7F9", borderRadius: 10, padding: "10px 12px", display: "flex", alignItems: "center", gap: 8 }}>
         {sug
-          ? <><TrendingUp className="w-4 h-4" style={{ color: sug.up ? "#10B981" : "#9097A1", flexShrink: 0 }} /><span>Last time: <b>{sug.last.w}×{sug.last.reps}</b> · suggested <b>{sug.next} lb</b></span></>
+          ? <><TrendingUp className="w-4 h-4" style={{ color: sug.up ? "#10B981" : "#9097A1", flexShrink: 0 }} /><span>Last time: <b>{sug.last.w}×{sug.last.reps}</b> · suggested <b>{sug.next} lb</b>{sug.note ? <span style={{ color: "#9097A1" }}> — {sug.note}</span> : null}</span></>
           : <><Sparkles className="w-4 h-4" style={{ color: VIOLET, flexShrink: 0 }} /><span>First time on this — log what you do and I'll suggest next time.</span></>}
       </div>
       <div style={{ marginBottom: 12 }}>
@@ -2050,6 +2378,7 @@ export default function App() {
   const [prefs, setPrefs] = useState(null);
   const [myLifts, setMyLifts] = useState({});
   const [gym, setGym] = useState(null); // { dk, slot }
+  const [aiWeekBusy, setAiWeekBusy] = useState(false);
 
   const date = todayKey();
   const me = meId ? profiles[meId] : null;
@@ -2094,6 +2423,22 @@ export default function App() {
     setMyStats(stats);
     setProgress({ weights, measures, photoIdx, images, history, stats });
     setProgressBusy(false);
+  }, []);
+
+  // Lightweight stats recompute (no photo images) so Today's streaks stay
+  // accurate even if Progress hasn't been opened — fixes stale streaks.
+  const refreshStats = useCallback(async (mid) => {
+    const weights = (await getJSON(`weights:${mid}`, true)) || [];
+    const measures = (await getJSON(`measure:${mid}`, true)) || [];
+    const photoIdx = (await getJSON(`photoidx:${mid}`)) || [];
+    const history = [];
+    for (let i = 0; i < 10; i++) {
+      const d = new Date(); d.setDate(d.getDate() - i); const dk = todayKey(d);
+      history.push({ date: dk, log: await getJSON(`log:${mid}:${dk}`, true), plan: await getJSON(`plan:${mid}:${dk}`, true) });
+    }
+    const stats = computeStats(history, weights, measures, photoIdx);
+    await store.set(`stats:${mid}`, stats, true);
+    setMyStats(stats);
   }, []);
 
   const loadWeek = useCallback(async (prof, pf) => {
@@ -2149,6 +2494,27 @@ export default function App() {
 
   useEffect(() => { if (tab === "progress" && meId) loadProgress(meId); }, [tab, meId, loadProgress]);
 
+  // Keep Today's streaks fresh even without opening Progress (item: streak reset).
+  useEffect(() => { if (meId) refreshStats(meId); }, [meId, refreshStats]);
+
+  // Auto-personalize a fresh week with AI once (replaces the old manual button).
+  useEffect(() => {
+    if (!meId || !me || !myWeek || !AI_PROXY) return;
+    const wk = myWeek.weekStart;
+    const touched = Object.values(myWeek.plans || {}).some((p) => (p.slots || []).some((s) => s.done || s.skipped || s.focus === "custom"));
+    if (touched) return;
+    let cancelled = false;
+    (async () => {
+      const flag = await store.get(`weekai:${meId}:${wk}`);
+      if (flag || cancelled) return;
+      await store.set(`weekai:${meId}:${wk}`, "1");
+      setAiWeekBusy(true);
+      try { await regenWeek(me, true); } catch (e) {}
+      if (!cancelled) setAiWeekBusy(false);
+    })();
+    return () => { cancelled = true; };
+  }, [meId, myWeek?.weekStart]); // eslint-disable-line
+
   async function handleSetupDone(profile, claimed) {
     if (!claimed) await store.set(`profile:${profile.id}`, profile, true);
     device.set(profile.id);
@@ -2170,6 +2536,18 @@ export default function App() {
     await store.set(`plan:${meId}:${dk}`, plan, true);
     setMyWeek((w) => (w ? { ...w, plans: { ...w.plans, [dk]: plan } } : w));
     if (dk === date) setMyPlan(plan);
+  }
+  // Save a changed day, then re-roll any downstream auto days that now repeat
+  // the previous day's focus (so no two leg days in a row).
+  async function changeDay(dk, plan) {
+    await store.set(`plan:${meId}:${dk}`, plan, true);
+    const dates = myWeek?.dates || weekDates(weekStartKey());
+    let plans = { ...(myWeek?.plans || {}), [dk]: plan };
+    const res = await resequenceForward(me, prefs || { like: {}, skip: {} }, plans, dates, dk);
+    plans = res.plans;
+    for (const d of res.changed) await store.set(`plan:${meId}:${d}`, plans[d], true);
+    setMyWeek({ weekStart: myWeek?.weekStart || weekStartKey(), dates, plans });
+    if (plans[date]) setMyPlan(plans[date]);
   }
   async function regenWeek(prof, useAI, note = "") {
     const who = prof || me;
@@ -2263,8 +2641,8 @@ export default function App() {
       <StyleInjector />
       {tab === "today" && <Today me={me} partner={partner} myLog={myLog} partnerLog={partnerLog} myPlan={myPlan} partnerPlan={partnerPlan} myStats={myStats} nudge={nudge} onClearNudge={clearNudge} onGo={setTab} onStart={(slot) => startGym(date, slot)} />}
       {tab === "food" && <Food me={me} log={myLog} onSave={saveMyLog} />}
-      {tab === "train" && <Train me={me} week={myWeek} prefs={prefs} onSaveDay={saveDay} onGenWeek={genWeek} onPref={bumpPreference} onStart={startGym} />}
-      {tab === "progress" && <Progress me={me} data={progress} busy={progressBusy} onLogWeight={logWeight} onLogMeasure={logMeasure} onAddPhoto={addPhoto} onDeletePhoto={deletePhoto} />}
+      {tab === "train" && <Train me={me} week={myWeek} prefs={prefs} onSaveDay={saveDay} onChangeDay={changeDay} onGenWeek={genWeek} onPref={bumpPreference} onStart={startGym} aiWeekBusy={aiWeekBusy} />}
+      {tab === "progress" && <Progress me={me} data={progress} busy={progressBusy} lifts={myLifts} onLogWeight={logWeight} onLogMeasure={logMeasure} onAddPhoto={addPhoto} onDeletePhoto={deletePhoto} />}
       {tab === "us" && <Us me={me} partner={partner} myLog={myLog} partnerLog={partnerLog} myPlan={myPlan} partnerPlan={partnerPlan} myStats={myStats} partnerStats={partnerStats} onNudge={sendNudge} />}
       {tab === "settings" && <SettingsView me={me} onEdit={() => setEditing(true)} onSwitch={async () => { device.del(); setMeId(null); setForceSetup(true); }} />}
 
